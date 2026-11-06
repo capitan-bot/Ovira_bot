@@ -1,0 +1,41 @@
+import json, logging
+from pathlib import Path
+from aiogram import Bot
+
+log = logging.getLogger(__name__)
+_FILE = Path("storage/log_topics.json")
+TOPICS = {"test": "🧪 سرویس تست", "delete": "🗑 حذف سرویس", "error": "🚨 خطاها"}
+
+
+def _load() -> dict:
+    try:
+        return json.loads(_FILE.read_text())
+    except Exception:
+        return {}
+
+
+async def _topic_id(bot: Bot, group_id: int, key: str) -> int | None:
+    data = _load()
+    if key in data:
+        return data[key]
+    try:
+        t = await bot.create_forum_topic(group_id, TOPICS[key])
+        data[key] = t.message_thread_id
+        _FILE.parent.mkdir(parents=True, exist_ok=True)
+        _FILE.write_text(json.dumps(data))
+        return t.message_thread_id
+    except Exception as e:
+        log.warning("create topic failed: %s", e)
+        return None
+
+
+async def notify_log(bot: Bot, key: str, text: str) -> None:
+    from config.settings import get_settings
+    gid = getattr(get_settings(), "log_group_id", None)
+    if not gid:
+        return
+    try:
+        tid = await _topic_id(bot, gid, key)
+        await bot.send_message(gid, text[:4000], message_thread_id=tid)
+    except Exception as e:
+        log.warning("log group send failed: %s", e)

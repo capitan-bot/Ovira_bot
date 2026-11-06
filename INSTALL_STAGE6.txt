@@ -1,0 +1,9 @@
+Stage 6: Sanaei + PasarGuard adapters, free test on every panel.
+
+cd /root
+unzip -o capitan_stage6.zip
+cd capitan
+docker compose up -d --build bot
+docker compose logs --tail 25 bot
+
+No migration needed. Backup of replaced files: see backup6/ (made by the commands in chat).

@@ -1,0 +1,173 @@
+"""Bot settings + free-test settings, edited through buttons."""
+import re
+
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
+
+from backend.services.settings_service import get_setting, get_settings_map, set_setting
+from backend.services.users import audit
+from bot.filters import AdminOnly, InputAction
+from bot.keyboards.admin import kb
+from bot.states.states import AdminStates
+from bot.utils import _DIGITS, edit_or_answer, parse_amount
+
+router = Router()
+router.message.filter(AdminOnly())
+router.callback_query.filter(AdminOnly())
+
+# key: (label, kind, (min, max), hint)
+DEFS: dict[str, tuple] = {
+    "shop_name": ("\U0001f3ea نام فروشگاه", "text", (2, 40), ""),
+    "start_message": ("\U0001f44b متن پیام استارت", "text", (5, 1000), "می\u200cتوانید از {name} (نام کاربر) و {shop} (نام فروشگاه) استفاده کنید."),
+    "card_number": ("\U0001f4b3 شماره کارت", "card", None, "۱۶ رقم"),
+    "card_holder": ("\U0001f464 نام صاحب کارت", "text", (2, 60), ""),
+    "support_id": ("\U0001f3a7 آیدی پشتیبانی", "support", None, "مثل @support \u2014 برای حذف \u00ab-\u00bb بفرستید."),
+    "charge_min": ("\u2b07\ufe0f حداقل شارژ (تومان)", "int", (1000, 1_000_000_000), ""),
+    "charge_max": ("\u2b06\ufe0f حداکثر شارژ (تومان)", "int", (1000, 1_000_000_000), ""),
+    "unique_extra_min": ("\U0001f522 حداقل مبلغ اضافه فاکتور", "int", (0, 100000), "مبلغ تصادفی برای شناسایی پرداخت"),
+    "unique_extra_max": ("\U0001f522 حداکثر مبلغ اضافه فاکتور", "int", (0, 100000), "بازه بزرگ\u200cتر = فاکتورهای هم\u200cزمان بیشتر"),
+    "invoice_ttl_minutes": ("\u23f3 اعتبار فاکتور (دقیقه)", "int", (5, 1440), ""),
+    "payment_success_text": ("\u2705 متن پرداخت موفق", "text", (3, 500), ""),
+    "payment_failed_text": ("\u274c متن پرداخت ناموفق", "text", (3, 500), "حتماً {reason} (دلیل رد) را در متن بگذارید."),
+    "notify_channel": ("\U0001f4e3 کانال اطلاع\u200cرسانی", "channel", None, "مثل @channel یا آیدی عددی \u2014 برای حذف \u00ab-\u00bb"),
+    "test_gb": ("\U0001f4e6 حجم تست (GB)", "float", (0.1, 100), "مثلاً 1 یا 0.5"),
+    "test_hours": ("\u23f1 مدت تست (ساعت)", "int", (1, 720), ""),
+    "test_max_per_user": ("\U0001f501 تعداد دفعات مجاز تست برای هر کاربر", "int", (1, 20), ""),
+}
+SETTINGS_MENU = ["shop_name", "start_message", "card_number", "card_holder", "support_id", "charge_min",
+                 "charge_max", "unique_extra_min", "unique_extra_max", "invoice_ttl_minutes",
+                 "payment_success_text", "payment_failed_text", "notify_channel"]
+_PAIRS = {"charge_min": ("charge_max", True), "charge_max": ("charge_min", False),
+          "unique_extra_min": ("unique_extra_max", True), "unique_extra_max": ("unique_extra_min", False)}
+_BACK = {k: "adm:ts" for k in ("test_gb", "test_hours", "test_max_per_user")}
+
+
+def validate(key: str, raw: str) -> tuple[bool, str]:
+    label, kind, rng, _ = DEFS[key]
+    raw = (raw or "").strip()
+    if kind == "text":
+        return (True, raw) if rng[0] <= len(raw) <= rng[1] else (False, f"طول متن باید بین {rng[0]} تا {rng[1]} حرف باشد.")
+    if kind == "int":
+        v = parse_amount(raw)
+        return (True, str(v)) if v is not None and rng[0] <= v <= rng[1] else (False, f"یک عدد بین {rng[0]:,} و {rng[1]:,} بفرستید.")
+    if kind == "float":
+        t = raw.translate(_DIGITS).replace("\u066b", ".").replace(",", ".")
+        if re.fullmatch(r"\d+(\.\d{1,2})?", t) and rng[0] <= float(t) <= rng[1]:
+            return True, t
+        return False, f"یک عدد بین {rng[0]} و {rng[1]} بفرستید."
+    if kind == "card":
+        d = re.sub(r"[\s-]", "", raw.translate(_DIGITS))
+        return (True, d) if re.fullmatch(r"\d{16}", d) else (False, "شماره کارت باید ۱۶ رقم باشد.")
+    if kind == "support":
+        if raw == "-":
+            return True, ""
+        return (True, raw if raw.startswith("@") else "@" + raw) if re.fullmatch(r"@?[A-Za-z0-9_]{5,32}", raw) else (False, "فرمت درست: @support_id")
+    if kind == "channel":
+        if raw == "-":
+            return True, ""
+        return (True, raw) if re.fullmatch(r"@[A-Za-z0-9_]{5,32}|-?\d{5,}", raw) else (False, "فرمت درست: @channel یا آیدی عددی")
+    return False, "نامعتبر"
+
+
+async def _menu_view(session):
+    vals = await get_settings_map(session, SETTINGS_MENU)
+    def short(k):
+        v = vals[k]
+        if k == "card_number" and v:
+            return "\u2022\u2022\u2022\u2022" + v[-4:]
+        return (v[:18] + "\u2026") if len(v) > 18 else (v or "\u2014")
+    rows = [[(f"{DEFS[k][0]}: {short(k)}", f"adm:sk:{k}")] for k in SETTINGS_MENU]
+    return "\u2699\ufe0f تنظیمات ربات\nروی هر مورد بزنید تا تغییرش بدهید:", kb(*rows, [("\U0001f519 پنل مدیریت", "adm:home")])
+
+
+@router.callback_query(F.data == "adm:st")
+async def settings_menu(cb: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    text, markup = await _menu_view(session)
+    await edit_or_answer(cb, text, markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:sk:\w+$"))
+async def edit_key(cb: CallbackQuery, session, state: FSMContext):
+    key = cb.data.split(":")[2]
+    if key not in DEFS:
+        await cb.answer()
+        return
+    label, _, _, hint = DEFS[key]
+    cur = await get_setting(session, key, "")
+    back = _BACK.get(key, "adm:st")
+    await state.set_state(AdminStates.input)
+    await state.set_data({"action": "setting", "key": key, "back": back})
+    await edit_or_answer(cb, f"{label}\n\nمقدار فعلی:\n{cur[:400] or '\u2014'}\n\n{hint}\n\nمقدار جدید را بفرستید:",
+                         kb([("\U0001f519 انصراف", back)]))
+    await cb.answer()
+
+
+@router.message(InputAction("setting"), F.text, ~F.text.startswith("/"))
+async def save_key(message: Message, session, state: FSMContext):
+    data = await state.get_data()
+    key = data["key"]
+    ok, val = validate(key, message.text)
+    if not ok:
+        await message.answer(f"\u274c {val}")
+        return
+    if key in _PAIRS:
+        other, is_min = _PAIRS[key]
+        ov = int(await get_setting(session, other, "0") or 0)
+        if (is_min and int(val) > ov) or (not is_min and int(val) < ov):
+            await message.answer(f"\u274c با مقدار \u00ab{DEFS[other][0]}\u00bb ({ov:,}) تناقض دارد.")
+            return
+    if key == "payment_failed_text" and "{reason}" not in val:
+        await message.answer("\u274c متن باید شامل {reason} باشد تا دلیل رد برای مشتری نمایش داده شود.")
+        return
+    await set_setting(session, key, val)
+    await state.clear()
+    await audit(session, f"admin:{message.from_user.id}", f"setting.{key}",
+                details={"value": "***" if key == "card_number" else val[:200]})
+    await message.answer("\u2705 ذخیره شد.")
+    if data["back"] == "adm:ts":
+        text, markup = await _test_view(session)
+    else:
+        text, markup = await _menu_view(session)
+    await message.answer(text, reply_markup=markup)
+
+
+# ---------- free test ----------
+async def _test_view(session):
+    v = await get_settings_map(session, ["test_enabled", "test_gb", "test_hours", "test_max_per_user"])
+    on = v["test_enabled"] == "1"
+    text = (
+        "\U0001f381 تنظیمات تست رایگان\n\n"
+        f"وضعیت: {'\U0001f7e2 فعال' if on else '\U0001f534 غیرفعال'}\n"
+        f"\U0001f4e6 حجم: {v['test_gb'] or '\u2014'} GB\n"
+        f"\u23f1 مدت: {v['test_hours'] or '\u2014'} ساعت\n"
+        f"\U0001f501 تعداد مجاز برای هر کاربر: {v['test_max_per_user'] or '\u2014'}\n\n"
+        "\u2139\ufe0f انتخاب پنل و پروفایل تست و ساخت واقعی تست بعد از آماده شدن آداپترهای پنل (مرحله ۴ تا ۶) فعال می\u200cشود. "
+        "هر کاربر بر اساس آیدی تلگرامش محدود می\u200cشود."
+    )
+    return text, kb(
+        [("\u23f8 غیرفعال کردن تست" if on else "\u25b6\ufe0f فعال کردن تست", "adm:tt")],
+        [("\U0001f4e6 حجم", "adm:sk:test_gb"), ("\u23f1 مدت", "adm:sk:test_hours")],
+        [("\U0001f501 تعداد دفعات", "adm:sk:test_max_per_user")],
+        [("\U0001f519 پنل مدیریت", "adm:home")],
+    )
+
+
+@router.callback_query(F.data == "adm:ts")
+async def test_menu(cb: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    text, markup = await _test_view(session)
+    await edit_or_answer(cb, text, markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:tt")
+async def test_toggle(cb: CallbackQuery, session):
+    on = (await get_setting(session, "test_enabled", "0")) == "1"
+    await set_setting(session, "test_enabled", "0" if on else "1")
+    await audit(session, f"admin:{cb.from_user.id}", "test.toggle", details={"enabled": not on})
+    text, markup = await _test_view(session)
+    await edit_or_answer(cb, text, markup)
+    await cb.answer()

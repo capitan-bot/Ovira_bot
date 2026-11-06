@@ -1,0 +1,315 @@
+"""Buying a subscription: panel -> profile -> GB -> days -> username -> pay from wallet -> create on panel."""
+import logging
+import re
+import uuid
+from datetime import timedelta
+
+from aiogram import Bot, F, Router
+from aiogram.filters import StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
+from sqlalchemy.exc import IntegrityError
+
+from adapters.base import CreateUserRequest, PanelError, UsernameTaken
+from backend.services.errors import DomainError, InsufficientFunds
+from bot.logger_group import notify_log
+from backend.services.settings_service import get_settings_map
+from backend.services.shop import (
+    GB, adapter_for, calc_price, complete_order, fail_order, inbound_ids, reserve_purchase,
+    sellable_panels, username_in_use, valid_username,
+)
+from backend.services.users import audit, get_wallet
+from bot.delivery import notify_admins, send_files, user_lock
+from bot.keyboards.shop import kb
+from bot.states.shop import BuyStates
+from bot.utils import _DIGITS, edit_or_answer, fmt_dt, fmt_money
+from database.base import utcnow
+from database.connection import session_scope
+from database.models import Panel, ServiceProfile
+
+log = logging.getLogger(__name__)
+router = Router()
+CANCEL = [("\u274c انصراف", "menu:main")]
+
+
+def _int(text: str) -> int | None:
+    """Strict whole number. (parse_amount would turn 1.5 into 15, which is dangerous for GB.)"""
+    t = (text or "").strip().translate(_DIGITS)
+    return int(t) if re.fullmatch(r"\d{1,6}", t) else None
+
+
+async def _find(session, panel_id: int, profile_id: int | None = None):
+    for panel, profiles in await sellable_panels(session):
+        if panel.id == panel_id:
+            if profile_id is None:
+                return panel, profiles
+            for p in profiles:
+                if p.id == profile_id:
+                    return panel, p
+    return None
+
+
+# ---------- choose panel / profile ----------
+@router.callback_query(F.data == "menu:buy")
+async def buy_start(cb: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    items = await sellable_panels(session)
+    if not items:
+        await edit_or_answer(cb, "\U0001f6d2 خرید اشتراک\n\nهم\u200cاکنون محصولی برای فروش آماده نیست. بعدا\u064b سر بزنید.",
+                             kb([("\U0001f519 بازگشت", "menu:main")]))
+        await cb.answer()
+        return
+    rows = [[(p.display_name, f"buy:p:{p.id}")] for p, _ in items]
+    await edit_or_answer(cb, "\U0001f6d2 خرید اشتراک\n\nیکی از گزینه\u200cها را انتخاب کنید:", kb(*rows, [("\U0001f519 بازگشت", "menu:main")]))
+    await cb.answer()
+
+
+async def _ask_gb(cb: CallbackQuery, state: FSMContext, panel: Panel, profile: ServiceProfile):
+    await state.clear()
+    await state.set_state(BuyStates.gb)
+    await state.set_data({"panel_id": panel.id, "profile_id": profile.id})
+    await edit_or_answer(
+        cb,
+        f"\U0001f6f0 {panel.display_name} \u2014 {profile.name}\n\n"
+        f"\U0001f4b0 قیمت هر گیگابایت: {fmt_money(panel.price_per_gb)} تومان\n"
+        f"\U0001f4c5 هزینه هر روز: {fmt_money(panel.price_per_day)} تومان\n\n"
+        f"\U0001f4be حجم موردنظر را به \u00abگیگابایت\u00bb و به صورت عدد بفرستید.\n"
+        f"حداقل {panel.min_gb} \u2014 حداکثر {panel.max_gb} گیگابایت",
+        kb([("\U0001f519 بازگشت", "menu:buy")]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^buy:p:\d+$"))
+async def pick_panel(cb: CallbackQuery, session, state: FSMContext):
+    found = await _find(session, int(cb.data.split(":")[2]))
+    if not found:
+        await cb.answer("این گزینه در حال حاضر قابل فروش نیست.", show_alert=True)
+        return
+    panel, profiles = found
+    if len(profiles) == 1:
+        await _ask_gb(cb, state, panel, profiles[0])
+        return
+    rows = [[(p.name, f"buy:f:{p.id}")] for p in profiles]
+    await edit_or_answer(cb, f"\U0001f6f0 {panel.display_name}\n\n✨ دارای ۴ پروتکل: وایرگارد (WireGuard)، اپن‌وی‌پی‌ان (OpenVPN)، سیسکو (Cisco) و امنزیا (Amnezia)\n\nسرویس موردنظر را انتخاب کنید:",
+                         kb(*rows, [("\U0001f519 بازگشت", "menu:buy")]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^buy:f:\d+$"))
+async def pick_profile(cb: CallbackQuery, session, state: FSMContext):
+    pid = int(cb.data.split(":")[2])
+    profile = await session.get(ServiceProfile, pid)
+    found = await _find(session, profile.panel_id, pid) if profile else None
+    if not found:
+        await cb.answer("این گزینه در حال حاضر قابل فروش نیست.", show_alert=True)
+        return
+    await _ask_gb(cb, state, found[0], found[1])
+
+
+# ---------- GB / days / username ----------
+@router.message(BuyStates.gb, F.text, ~F.text.startswith("/"))
+async def got_gb(message: Message, session, state: FSMContext):
+    panel = await session.get(Panel, (await state.get_data())["panel_id"])
+    gb = _int(message.text)
+    if gb is None or not panel.min_gb <= gb <= panel.max_gb:
+        await message.answer(f"\u274c یک عدد صحیح بین {panel.min_gb} و {panel.max_gb} بفرستید.")
+        return
+    await state.update_data(gb=gb)
+    await state.set_state(BuyStates.days)
+    await message.answer(
+        f"\U0001f4c5 مدت سرویس را به \u00abروز\u00bb و به صورت عدد بفرستید.\nحداقل {panel.min_days} \u2014 حداکثر {panel.max_days} روز",
+        reply_markup=kb(CANCEL))
+
+
+@router.message(BuyStates.days, F.text, ~F.text.startswith("/"))
+async def got_days(message: Message, session, state: FSMContext):
+    panel = await session.get(Panel, (await state.get_data())["panel_id"])
+    days = _int(message.text)
+    if days is None or not panel.min_days <= days <= panel.max_days:
+        await message.answer(f"\u274c یک عدد صحیح بین {panel.min_days} و {panel.max_days} بفرستید.")
+        return
+    await state.update_data(days=days)
+    await state.set_state(BuyStates.username)
+    await message.answer(
+        "\U0001f464 یک \u00abنام کاربری\u00bb برای سرویس انتخاب کنید.\n"
+        "فقط حروف انگلیسی\u060c عدد و _ (۳ تا ۲۰ کاراکتر)\u060c مثلا\u064b ali_vpn",
+        reply_markup=kb(CANCEL))
+
+
+@router.message(BuyStates.username, F.text, ~F.text.startswith("/"))
+async def got_username(message: Message, session, state: FSMContext, db_user):
+    data = await state.get_data()
+    name = message.text.strip()
+    if not valid_username(name):
+        await message.answer("\u274c نام کاربری نامعتبر است. فقط حروف انگلیسی\u060c عدد و _ (۳ تا ۲۰ کاراکتر).")
+        return
+    panel = await session.get(Panel, data["panel_id"])
+    profile = await session.get(ServiceProfile, data["profile_id"])
+    if await username_in_use(session, panel.id, name):
+        await message.answer("\u274c این نام کاربری قبلا\u064b استفاده شده است. نام دیگری بفرستید.")
+        return
+    try:
+        if await adapter_for(panel).username_exists(name):
+            await message.answer("\u274c این نام کاربری قبلا\u064b استفاده شده است. نام دیگری بفرستید.")
+            return
+    except PanelError as e:
+        log.warning("username check failed on panel %s: %s", panel.id, e)
+        await message.answer("\u26a0\ufe0f اتصال به سرور برقرار نشد. کمی بعد دوباره تلاش کنید.")
+        return
+
+    gb, days = data["gb"], data["days"]
+    price = calc_price(panel, gb, days)
+    balance = (await get_wallet(session, db_user.id)).balance
+    key = uuid.uuid4().hex
+    await state.set_state(None)
+    await state.update_data(username=name, order_key=key)
+    text = (
+        "\U0001f9fe خلاصه سفارش\n\n"
+        f"\U0001f6f0 {panel.display_name} \u2014 {profile.name}\n"
+        f"\U0001f464 نام کاربری: {name}\n"
+        f"\U0001f4be حجم: {gb} گیگابایت\n"
+        f"\U0001f4c5 مدت: {days} روز\n\n"
+        f"\U0001f4b0 مبلغ: {fmt_money(price)} تومان\n"
+        f"\U0001f4b3 موجودی شما: {fmt_money(balance)} تومان"
+    )
+    if balance >= price:
+        await message.answer(text, reply_markup=kb([("\u2705 تأیید و پرداخت از کیف پول", "buy:go")], CANCEL))
+    else:
+        await message.answer(
+            f"{text}\n\n\u274c موجودی کافی نیست. کمبود: {fmt_money(price - balance)} تومان",
+            reply_markup=kb([("\U0001f4b3 شارژ کیف پول", "wallet:charge")], CANCEL))
+
+
+@router.message(StateFilter(BuyStates.gb, BuyStates.days, BuyStates.username))
+async def wrong_input(message: Message):
+    await message.answer("لطفا\u064b پیام متنی بفرستید. (انصراف: /cancel)")
+
+
+# ---------- pay + create ----------
+@router.callback_query(F.data == "buy:go")
+async def buy_go(cb: CallbackQuery, session, state: FSMContext, db_user, bot: Bot):
+    data = await state.get_data()
+    key = data.get("order_key")
+    if not key or "username" not in data:
+        await cb.answer("این درخواست منقضی شده است. دوباره از منوی خرید شروع کنید.", show_alert=True)
+        return
+    await state.clear()
+    lock = user_lock(db_user.id)
+    if lock.locked():
+        await cb.answer("سفارش شما در حال پردازش است.", show_alert=True)
+        return
+    async with lock:
+        await cb.answer()
+        cfg = await get_settings_map(session, ["delivery_text"])
+        await _purchase(cb, bot, db_user, data, key, cfg["delivery_text"] or "\U0001f389 سرویس شما با موفقیت ساخته شد!")
+
+
+async def _purchase(cb: CallbackQuery, bot: Bot, user, data: dict, key: str, delivery_text: str) -> None:
+    username = data["username"]
+    # Phase 1 (committed on its own): order + wallet debit.
+    try:
+        async with session_scope() as s:
+            order = await reserve_purchase(
+                s, user_id=user.id, panel_id=data["panel_id"], profile_id=data["profile_id"],
+                username=username, gb=data["gb"], days=data["days"], key=key)
+            panel = await s.get(Panel, order.panel_id)
+            profile = await s.get(ServiceProfile, order.profile_id)
+    except InsufficientFunds:
+        await edit_or_answer(cb, "\u274c موجودی کیف پول کافی نیست.",
+                             kb([("\U0001f4b3 شارژ کیف پول", "wallet:charge")], [("\U0001f519 منو", "menu:main")]))
+        return
+    except IntegrityError:
+        await edit_or_answer(cb, "\u274c این سفارش قبلا\u064b ثبت شده یا این نام کاربری در حال استفاده است.",
+                             kb([("\U0001f519 منو", "menu:main")]))
+        return
+    except DomainError as e:
+        await edit_or_answer(cb, f"\u274c {e}", kb([("\U0001f519 منو", "menu:main")]))
+        return
+
+    await edit_or_answer(cb, "\u23f3 پرداخت انجام شد. در حال ساخت سرویس ...", None)
+
+    # Phase 2: talk to the panel (no DB transaction is held open).
+    adapter = adapter_for(panel)
+    attempted = False
+    try:
+        if await adapter.username_exists(username):
+            raise UsernameTaken(f"user name '{username}' already exists on the panel")
+        attempted = True
+        remote = await adapter.create_user(CreateUserRequest(
+            username=username, total_bytes=order.gb * GB, expires_at=utcnow() + timedelta(days=order.days),
+            inbound_ids=inbound_ids(profile), settings=dict(profile.settings or {})))
+    except Exception as e:  # noqa: BLE001 - every failure must end in a refund
+        err = str(e) if isinstance(e, PanelError) else f"{type(e).__name__}: {e}"
+        log.exception("provisioning order %s failed", order.id)
+        if attempted and not isinstance(e, UsernameTaken):
+            try:
+                await adapter.delete_user(username)      # remove a half-created user so nothing is left behind
+            except Exception as ce:  # noqa: BLE001
+                log.warning("cleanup of %s failed: %s", username, ce)
+        try:
+            async with session_scope() as s:
+                balance = await fail_order(s, order.id, err)
+                await audit(s, f"user:{user.telegram_id}", "order.failed", target=f"order:{order.id}",
+                            details={"error": err[:300]})
+        except Exception:  # noqa: BLE001
+            log.exception("REFUND FAILED for order %s", order.id)
+            await notify_admins(bot, f"\U0001f6a8 بازگشت وجه سفارش #{order.id} (کاربر {user.telegram_id}) انجام نشد!\n{err[:300]}")
+            await edit_or_answer(cb, "\u26a0\ufe0f ساخت سرویس انجام نشد و بازگشت خودکار وجه با مشکل روبه\u200cرو شد. "
+                                     "به پشتیبانی پیام بدهید\u061b مبلغ شما محفوظ است.", kb([("\U0001f519 منو", "menu:main")]))
+            return
+        if isinstance(e, UsernameTaken):
+            msg = "\u274c این نام کاربری هم\u200cاکنون روی سرور وجود دارد. مبلغ به کیف پول برگشت\u061b با نام دیگری دوباره تلاش کنید."
+        else:
+            msg = "\u274c ساخت سرویس انجام نشد (مشکل در ارتباط با سرور). مبلغ به کیف پول شما برگشت."
+        await edit_or_answer(cb, f"{msg}\n\U0001f4b0 موجودی: {fmt_money(balance)} تومان",
+                             kb([("\U0001f6d2 تلاش دوباره", "menu:buy")], [("\U0001f519 منو", "menu:main")]))
+        await notify_admins(bot, f"\u26a0\ufe0f ساخت سرویس ناموفق بود (وجه برگشت داده شد)\nسفارش #{order.id} | کاربر {user.telegram_id}\n"
+                                 f"پنل: {panel.display_name}\nخطا: {err[:400]}")
+        return
+
+    # Phase 3: record the service.
+    saved = True
+    try:
+        async with session_scope() as s:
+            svc = await complete_order(s, order.id, remote)
+            await audit(s, f"user:{user.telegram_id}", "order.completed", target=f"order:{order.id}")
+            expires = svc.expires_at
+    except Exception:  # noqa: BLE001
+        saved = False
+        expires = remote.expires_at
+        log.exception("service for order %s exists on the panel but could not be saved", order.id)
+        await notify_admins(bot, f"\U0001f6a8 سرویس روی پنل ساخته شد ولی در دیتابیس ثبت نشد!\nسفارش #{order.id} | "
+                                 f"کاربر {user.telegram_id} | پنل {panel.display_name} | نام کاربری {username}")
+
+    await edit_or_answer(
+        cb,
+        f"{delivery_text}\n\n\U0001f464 نام کاربری: {username}\n\U0001f4be حجم: {order.gb} گیگابایت\n"
+        f"\U0001f4c5 مدت: {order.days} روز\n\u23f3 انقضا: {fmt_dt(expires)}"
+        + ("" if saved else "\n\n\u26a0\ufe0f ثبت سرویس در لیست شما با تأخیر انجام می\u200cشود\u061b اگر دیده نشد به پشتیبانی پیام بدهید."),
+        kb([("\U0001f4e6 سرویس\u200cهای من", "menu:services")], [("\U0001f3e0 منو", "menu:main")]),
+    )
+    if not await send_files(bot, cb.message.chat.id, remote.config_files, remote.subscription_link):
+        await bot.send_message(cb.message.chat.id, "\u2139\ufe0f سرور فایل کانفیگ برنگرداند. از \u00abسرویس\u200cهای من \u2190 دریافت کانفیگ\u00bb دوباره امتحان کنید.")
+
+    _u = cb.from_user
+    await notify_log(bot, "buy",
+                     "🛒 خرید جدید\n"
+                     f"👤 {_u.full_name} | {('@' + _u.username) if _u.username else '—'} | {_u.id}\n"
+                     f"🛰 پنل: {panel.display_name}\n"
+                     f"📦 سرویس: {username}\n"
+                     f"💾 {order.gb} گیگابایت | 📅 {order.days} روز\n"
+                     f"⏳ انقضا: {fmt_dt(expires)}")
+
+    # Thank-you message with the purchase summary.
+    await bot.send_message(
+        cb.message.chat.id,
+        "\U0001f64f ممنون از خرید شما!\n\n"
+        "سرویس شما با مشخصات زیر آماده است:\n"
+        f"\U0001f464 نام: {username}\n"
+        f"\U0001f4be حجم: {order.gb} گیگابایت\n"
+        f"\U0001f4c5 مدت: {order.days} روز\n"
+        f"\u23f3 انقضا: {fmt_dt(expires)}\n\n"
+        "برای تمدید، دریافت QR کد، لینک جدید یا خاموش/روشن کردن سرویس از «\U0001f4e6 سرویس\u200cهای من» استفاده کنید.",
+        reply_markup=kb([("\U0001f4e6 سرویس\u200cهای من", "menu:services")], [("\U0001f3e0 منو", "menu:main")]),
+    )

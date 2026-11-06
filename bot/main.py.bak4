@@ -1,0 +1,81 @@
+import asyncio
+import logging
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from backend.services.invoices import expire_old_invoices
+from bot.handlers import (
+    admin, admin_broadcast, admin_panel, admin_panels, admin_profiles, admin_settings, admin_tests, admin_users,
+    buy, charge, free_test, menu, my_services, review, service_actions, start,
+)
+from bot.middlewares.db import DbSessionMiddleware
+from bot.middlewares.user import UserMiddleware
+from bot.logger_group import notify_log
+from config.settings import get_settings
+from database.connection import session_scope
+
+log = logging.getLogger("capitan")
+
+
+async def invoice_expiry_loop() -> None:
+    while True:
+        try:
+            async with session_scope() as s:
+                n = await expire_old_invoices(s)
+            if n:
+                log.info("Expired %s unpaid invoices", n)
+        except Exception:
+            log.exception("invoice expiry failed")
+        await asyncio.sleep(300)
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cfg = get_settings()
+    if not cfg.bot_token:
+        raise SystemExit("BOT_TOKEN is empty in .env")
+
+    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=None))
+    dp = Dispatcher(storage=MemoryStorage())  # in-memory FSM: a restart resets half-finished flows
+
+    dp.update.outer_middleware(DbSessionMiddleware())
+    dp.update.outer_middleware(UserMiddleware())
+    # Order matters: buy / free_test / my_services must come before menu (menu still holds the
+    # "coming soon" fallback for sections that are not built yet, e.g. support).
+    dp.include_routers(
+        admin.router, admin_panel.router, admin_users.router, admin_panels.router, admin_profiles.router,
+        admin_tests.router,   # before admin_settings: it takes over the free-test buttons
+        admin_settings.router, admin_broadcast.router,
+        review.router, start.router, charge.router,
+        buy.router, free_test.router, my_services.router, service_actions.router, menu.router,
+    )
+
+    @dp.error()
+    async def on_error(event):
+        log.exception("Unhandled error: %s", event.exception)
+        try:
+            await notify_log(bot, "error",
+                             f"🚨 خطای ناخواسته در ربات\n{type(event.exception).__name__}: {str(event.exception)[:500]}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    me = await bot.get_me()
+    log.info("Bot started as @%s", me.username)
+    for admin_id in cfg.admin_telegram_ids:
+        try:
+            await bot.send_message(admin_id, "\u2705 ربات CAPITAN VPN روشن شد.\nبرای پنل مدیریت: /admin")
+        except Exception as e:
+            log.warning("Could not notify admin %s: %s", admin_id, e)
+
+    expiry_task = asyncio.create_task(invoice_expiry_loop())
+    await bot.delete_webhook(drop_pending_updates=False)
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        expiry_task.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

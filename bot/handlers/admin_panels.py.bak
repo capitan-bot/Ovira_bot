@@ -1,0 +1,319 @@
+"""VPN panel management inside Telegram: add / edit / switch on-off / pricing / delete."""
+import logging
+from datetime import datetime, timezone
+
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
+from sqlalchemy import select
+
+from adapters.base import ADAPTERS, PanelCredentials, PanelError, build_adapter
+from backend.services.panel_admin import create_panel, delete_panel, panel_usage, update_credentials
+from backend.services.users import audit
+from bot.filters import AdminOnly, InputAction
+from bot.keyboards.admin import kb
+from bot.states.states import AdminStates
+from bot.utils import edit_or_answer, fmt_dt, fmt_money, parse_amount
+from config.crypto import decrypt_text
+from database.models import ConnStatus, Panel, PanelType
+
+log = logging.getLogger(__name__)
+router = Router()
+router.message.filter(AdminOnly())
+router.callback_query.filter(AdminOnly())
+
+TYPE_LABEL = {PanelType.PASARGUARD: "\u067e\u0627\u0633\u0627\u0631\u06af\u0627\u062f", PanelType.SANAEI: "\u0633\u0646\u0627\u06cc\u06cc (VLESS)", PanelType.OVIRA: "\u0627\u0648\u06cc\u0631\u0627 (OpenVPN / WireGuard)"}
+CONN_LABEL = {ConnStatus.UNKNOWN: "\u26aa\ufe0f بررسی نشده", ConnStatus.ONLINE: "\U0001f7e2 متصل", ConnStatus.OFFLINE: "\U0001f534 قطع"}
+PRICE_FIELDS = {
+    "price_per_gb": "\U0001f4b0 قیمت هر گیگ", "price_per_day": "\U0001f4c5 هزینه هر روز",
+    "min_gb": "\u2b07\ufe0f حداقل حجم (GB)", "max_gb": "\u2b06\ufe0f حداکثر حجم (GB)",
+    "min_days": "\u2b07\ufe0f حداقل روز", "max_days": "\u2b06\ufe0f حداکثر روز",
+}
+_PAIRS = {"min_gb": ("max_gb", True), "max_gb": ("min_gb", False),
+          "min_days": ("max_days", True), "max_days": ("min_days", False)}
+
+
+async def _get(session, pid: int) -> Panel | None:
+    return (await session.execute(select(Panel).where(Panel.id == pid))).scalar_one_or_none()
+
+
+def _card(p: Panel):
+    text = (
+        f"\U0001f6f0 {p.display_name}\n\n"
+        f"نوع: {TYPE_LABEL.get(p.panel_type, p.panel_type.value)}\n"
+        f"آدرس: {p.api_url}\n"
+        f"وضعیت پنل: {'\U0001f7e2 روشن' if p.is_active else '\U0001f534 خاموش'}\n"
+        f"فروش: {'\u2705 فعال' if p.sales_enabled else '\u26d4 متوقف'}\n"
+        f"اتصال: {CONN_LABEL[p.conn_status]}"
+        f"{(' \u2014 ' + fmt_dt(p.last_checked_at)) if p.last_checked_at else ''}\n"
+        f"{('آخرین خطا: ' + p.last_error[:150] + chr(10)) if p.last_error else ''}"
+        f"\n\U0001f4b0 تعرفه: هر گیگ {fmt_money(p.price_per_gb)} | هر روز {fmt_money(p.price_per_day)} تومان\n"
+        f"حجم: {p.min_gb}\u2013{p.max_gb} GB | مدت: {p.min_days}\u2013{p.max_days} روز\n\n"
+        "\u2139\ufe0f پروفایل\u200cها و Inboundها بعد از آماده شدن آداپتر این پنل (مرحله ۴ و ۵) از خود پنل خوانده می\u200cشوند."
+    )
+    markup = kb(
+        [("\u23fb خاموش کردن پنل" if p.is_active else "\u23fb روشن کردن پنل", f"adm:pt:{p.id}:active"),
+         ("\u26d4 توقف فروش" if p.sales_enabled else "\u25b6\ufe0f شروع فروش", f"adm:pt:{p.id}:sales")],
+        [("\u270f\ufe0f تغییر نام", f"adm:pr:{p.id}"), ("\U0001f4b0 تعرفه", f"adm:pp:{p.id}")],
+        [("\U0001f50c تست اتصال", f"adm:pc:{p.id}"), ("\U0001f511 تغییر آدرس/ورود", f"adm:pe:{p.id}")],
+        [("\U0001f5d1 حذف پنل", f"adm:pd:{p.id}")],
+        [("\U0001f519 لیست پنل\u200cها", "adm:pn")],
+    )
+    return text, markup
+
+
+async def _ask(target, state: FSMContext, action: str, text: str, back: str, **data):
+    await state.set_state(AdminStates.input)
+    await state.set_data({"action": action, **data})
+    markup = kb([("\U0001f519 انصراف", back)])
+    if isinstance(target, CallbackQuery):
+        await edit_or_answer(target, text, markup)
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+async def _show(target, session, pid: int):
+    p = await _get(session, pid)
+    text, markup = _card(p) if p else ("پنل پیدا نشد.", kb([("\U0001f519 لیست پنل\u200cها", "adm:pn")]))
+    if isinstance(target, CallbackQuery):
+        await edit_or_answer(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+# ---------- list ----------
+@router.callback_query(F.data == "adm:pn")
+async def panels_list(cb: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    panels = (await session.execute(select(Panel).order_by(Panel.sort_order, Panel.id))).scalars().all()
+    rows = [[(f"{'\U0001f7e2' if p.is_active else '\U0001f534'} {p.display_name} {'' if p.sales_enabled else '\u26d4'}", f"adm:p:{p.id}")]
+            for p in panels]
+    await edit_or_answer(cb, "\U0001f6f0 مدیریت پنل\u200cها\n\n" + ("پنل\u200cهای ثبت\u200cشده:" if panels else "هنوز پنلی اضافه نشده است."),
+                         kb(*rows, [("\u2795 افزودن پنل", "adm:pa")], [("\U0001f519 پنل مدیریت", "adm:home")]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:p:\d+$"))
+async def panel_card(cb: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    await _show(cb, session, int(cb.data.split(":")[2]))
+    await cb.answer()
+
+
+# ---------- toggles ----------
+@router.callback_query(F.data.regexp(r"^adm:pt:\d+:(active|sales)$"))
+async def toggle(cb: CallbackQuery, session):
+    _, _, pid, what = cb.data.split(":")
+    p = await _get(session, int(pid))
+    if p is None:
+        await cb.answer("پنل پیدا نشد", show_alert=True)
+        return
+    if what == "active":
+        p.is_active = not p.is_active
+    else:
+        p.sales_enabled = not p.sales_enabled
+    await audit(session, f"admin:{cb.from_user.id}", f"panel.{what}", target=f"panel:{p.id}",
+                details={"active": p.is_active, "sales": p.sales_enabled})
+    await _show(cb, session, p.id)
+    await cb.answer("انجام شد \u2705")
+
+
+# ---------- add / edit credentials ----------
+@router.callback_query(F.data == "adm:pa")
+async def add_start(cb: CallbackQuery, state: FSMContext):
+    await _ask(cb, state, "padd_name", "\u2795 افزودن پنل\n\nنام نمایشی پنل را بفرستید (مشتری این نام را می\u200cبیند؛ مثلاً \u00ab\U0001f7e3 پنل اختصاصی\u00bb):",
+               "adm:pn")
+
+
+@router.message(InputAction("padd_name"), F.text, ~F.text.startswith("/"))
+async def add_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not 2 <= len(name) <= 40:
+        await message.answer("\u274c نام باید بین ۲ تا ۴۰ حرف باشد.")
+        return
+    await state.update_data(action="padd_type", name=name)
+    await message.answer("نوع پنل را انتخاب کنید:", reply_markup=kb(
+        [("\U0001f7e3 \u067e\u0627\u0633\u0627\u0631\u06af\u0627\u062f", "adm:pat:pasarguard")],
+        [("\U0001f535 \u0633\u0646\u0627\u06cc\u06cc (VLESS)", "adm:pat:sanaei")],
+        [("\U0001f7e2 \u0627\u0648\u06cc\u0631\u0627 (OpenVPN / WireGuard)", "adm:pat:ovira")],
+        [("\U0001f519 انصراف", "adm:pn")]))
+
+
+@router.callback_query(F.data.startswith("adm:pat:"))
+async def add_type(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("action") != "padd_type":
+        await cb.answer("درخواست منقضی شده است.", show_alert=True)
+        return
+    await state.update_data(action="padd_url", ptype=cb.data.split(":")[2])
+    await edit_or_answer(cb, "\U0001f310 آدرس پنل را بفرستید (با http/https و پورت؛ مثال: https://1.2.3.4:2053/path):",
+                         kb([("\U0001f519 انصراف", "adm:pn")]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:pe:\d+$"))
+async def edit_creds(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[2])
+    await _ask(cb, state, "padd_url", "\U0001f310 آدرس جدید پنل را بفرستید:", f"adm:p:{pid}", pid=pid)
+
+
+@router.message(InputAction("padd_url"), F.text, ~F.text.startswith("/"))
+async def add_url(message: Message, state: FSMContext):
+    url = message.text.strip()
+    if not (url.startswith("http://") or url.startswith("https://")) or len(url) > 250 or " " in url:
+        await message.answer("\u274c آدرس باید با http:// یا https:// شروع شود.")
+        return
+    await state.update_data(action="padd_user", url=url)
+    await message.answer("\U0001f464 نام کاربری ورود به پنل را بفرستید:")
+
+
+@router.message(InputAction("padd_user"), F.text, ~F.text.startswith("/"))
+async def add_user(message: Message, state: FSMContext):
+    await state.update_data(action="padd_pass", username=message.text.strip())
+    await message.answer("\U0001f511 رمز عبور پنل را بفرستید (پیام شما بعد از دریافت پاک می\u200cشود و رمز رمزنگاری\u200cشده ذخیره می\u200cشود):")
+
+
+@router.message(InputAction("padd_pass"), F.text, ~F.text.startswith("/"))
+async def add_pass(message: Message, session, state: FSMContext):
+    data = await state.get_data()
+    password = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await state.clear()
+    if data.get("pid"):
+        p = await _get(session, data["pid"])
+        await update_credentials(session, p, api_url=data["url"], username=data["username"], password=password)
+        p.conn_status, p.last_error = ConnStatus.UNKNOWN, None
+        await audit(session, f"admin:{message.from_user.id}", "panel.credentials", target=f"panel:{p.id}")
+        await message.answer("\u2705 اطلاعات پنل به\u200cروزرسانی شد.")
+    else:
+        p = await create_panel(session, name=data["name"], panel_type=PanelType(data["ptype"]),
+                               api_url=data["url"], username=data["username"], password=password)
+        await audit(session, f"admin:{message.from_user.id}", "panel.create", target=f"panel:{p.id}",
+                    details={"name": p.display_name, "type": p.panel_type.value})
+        await message.answer("\u2705 پنل اضافه شد. تعرفه را تنظیم کنید و بعد از آماده شدن آداپتر، تست اتصال بزنید.")
+    await _show(message, session, p.id)
+
+
+# ---------- rename ----------
+@router.callback_query(F.data.regexp(r"^adm:pr:\d+$"))
+async def rename_start(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[2])
+    await _ask(cb, state, "prename", "\u270f\ufe0f نام جدید پنل را بفرستید:", f"adm:p:{pid}", pid=pid)
+
+
+@router.message(InputAction("prename"), F.text, ~F.text.startswith("/"))
+async def rename_do(message: Message, session, state: FSMContext):
+    name = message.text.strip()
+    if not 2 <= len(name) <= 40:
+        await message.answer("\u274c نام باید بین ۲ تا ۴۰ حرف باشد.")
+        return
+    pid = (await state.get_data())["pid"]
+    await state.clear()
+    p = await _get(session, pid)
+    p.display_name = name
+    await audit(session, f"admin:{message.from_user.id}", "panel.rename", target=f"panel:{pid}", details={"name": name})
+    await message.answer("\u2705 نام ذخیره شد.")
+    await _show(message, session, pid)
+
+
+# ---------- pricing ----------
+@router.callback_query(F.data.regexp(r"^adm:pp:\d+$"))
+async def pricing(cb: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    pid = int(cb.data.split(":")[2])
+    p = await _get(session, pid)
+    lines = "\n".join(f"{label}: {fmt_money(getattr(p, f))}" for f, label in PRICE_FIELDS.items())
+    btns = [[(label, f"adm:ppf:{pid}:{f}")] for f, label in PRICE_FIELDS.items()]
+    await edit_or_answer(cb, f"\U0001f4b0 تعرفه \u00ab{p.display_name}\u00bb\n\n{lines}\n\nبرای تغییر، روی مورد موردنظر بزنید:",
+                         kb(*btns, [("\U0001f519 پنل", f"adm:p:{pid}")]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:ppf:\d+:\w+$"))
+async def price_field(cb: CallbackQuery, session, state: FSMContext):
+    _, _, pid, field = cb.data.split(":")
+    if field not in PRICE_FIELDS:
+        await cb.answer()
+        return
+    p = await _get(session, int(pid))
+    await _ask(cb, state, "pfield", f"{PRICE_FIELDS[field]}\nمقدار فعلی: {fmt_money(getattr(p, field))}\n\nمقدار جدید را (عدد) بفرستید:",
+               f"adm:pp:{pid}", pid=int(pid), field=field)
+
+
+@router.message(InputAction("pfield"), F.text, ~F.text.startswith("/"))
+async def price_set(message: Message, session, state: FSMContext):
+    data = await state.get_data()
+    val = parse_amount(message.text)
+    field = data["field"]
+    if val is None or val <= 0:
+        await message.answer("\u274c یک عدد مثبت بفرستید.")
+        return
+    p = await _get(session, data["pid"])
+    if field in _PAIRS:
+        other, is_min = _PAIRS[field]
+        ov = getattr(p, other)
+        if (is_min and val > ov) or (not is_min and val < ov):
+            await message.answer(f"\u274c حداقل نباید از حداکثر بیشتر شود (مقدار {PRICE_FIELDS[other]}: {ov}).")
+            return
+    setattr(p, field, val)
+    await state.clear()
+    await audit(session, f"admin:{message.from_user.id}", "panel.price", target=f"panel:{p.id}",
+                details={"field": field, "value": val})
+    await message.answer("\u2705 ذخیره شد.")
+    await _show(message, session, p.id)
+
+
+# ---------- connection test ----------
+@router.callback_query(F.data.regexp(r"^adm:pc:\d+$"))
+async def test_conn(cb: CallbackQuery, session):
+    pid = int(cb.data.split(":")[2])
+    p = await _get(session, pid)
+    if p.panel_type.value not in ADAPTERS:
+        await cb.answer("آداپتر این نوع پنل هنوز پیاده\u200cسازی نشده است (مرحله ۴/۵). تست اتصال فعلاً ممکن نیست.",
+                        show_alert=True)
+        return
+    creds = PanelCredentials(api_url=p.api_url, username=decrypt_text(p.username_enc),
+                             password=decrypt_text(p.password_enc), token=decrypt_text(p.token_enc), extra=p.extra or {})
+    try:
+        await build_adapter(p.panel_type.value, creds).test_connection()
+        p.conn_status, p.last_error = ConnStatus.ONLINE, None
+        msg = "اتصال موفق بود \u2705"
+    except PanelError as e:
+        p.conn_status, p.last_error = ConnStatus.OFFLINE, str(e)[:500]
+        msg = "اتصال ناموفق بود \u274c"
+    p.last_checked_at = datetime.now(timezone.utc)
+    await _show(cb, session, pid)
+    await cb.answer(msg, show_alert=True)
+
+
+# ---------- delete ----------
+@router.callback_query(F.data.regexp(r"^adm:pd:\d+$"))
+async def delete_ask(cb: CallbackQuery, session):
+    pid = int(cb.data.split(":")[2])
+    used = await panel_usage(session, pid)
+    if used:
+        await cb.answer(f"این پنل {used} سفارش/سرویس دارد و حذف نمی\u200cشود. به\u200cجای حذف، فروش یا پنل را خاموش کنید.",
+                        show_alert=True)
+        return
+    await edit_or_answer(cb, "\u26a0\ufe0f این پنل و پروفایل\u200cهایش برای همیشه حذف می\u200cشود. مطمئنید؟",
+                         kb([("\U0001f5d1 بله، حذف شود", f"adm:pdy:{pid}")], [("\U0001f519 انصراف", f"adm:p:{pid}")]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:pdy:\d+$"))
+async def delete_do(cb: CallbackQuery, session):
+    pid = int(cb.data.split(":")[2])
+    p = await _get(session, pid)
+    name = p.display_name if p else ""
+    deleted = bool(p and await delete_panel(session, p))
+    if deleted:
+        await audit(session, f"admin:{cb.from_user.id}", "panel.delete", target=f"panel:{pid}", details={"name": name})
+        await cb.answer("حذف شد \u2705")
+    else:
+        await cb.answer("حذف انجام نشد.", show_alert=True)
+    await edit_or_answer(cb, "\U0001f6f0 پنل حذف شد." if deleted else "\u274c حذف انجام نشد.",
+                         kb([("\U0001f519 لیست پنل\u200cها", "adm:pn")]))
