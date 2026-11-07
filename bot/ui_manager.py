@@ -65,6 +65,22 @@ def init_custom_db() -> None:
         """)
         conn.commit()
 
+    # انتقال ایموجی‌های قبلی از دیتابیس قدیمی در صورت وجود
+    old_db = Path("storage/emojis.db")
+    if old_db.exists():
+        try:
+            with sqlite3.connect(old_db) as oconn:
+                rows = oconn.execute("SELECT base_emoji, custom_emoji_id FROM premium_emojis").fetchall()
+            if rows:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO premium_emojis (base_emoji, custom_emoji_id) VALUES (?, ?)",
+                        rows
+                    )
+                    conn.commit()
+        except Exception:
+            pass
+
 # --- توابع ایموجی پریمیوم ---
 def set_premium_emoji(base_emoji: str, custom_emoji_id: str) -> None:
     init_custom_db()
@@ -183,7 +199,7 @@ def process_outgoing_text(text: str, was_html: bool = False) -> tuple[str, bool]
     if not text:
         return text, False
 
-    if any(k in text for k in ("پنل سفارشی‌سازی", "مدیریت ایموجی‌های پریمیوم", "مدیریت رنگ دکمه‌های ربات")):
+    if any(k in text for k in ("مدیریت تغییرات ظاهری", "مدیریت ایموجی‌های پریمیوم", "مدیریت رنگ دکمه‌های ربات", "تغییر جایگاه و چیدمان")):
         return text, was_html
 
     replacements = get_text_replacements()
@@ -218,7 +234,6 @@ def _apply_color_to_btn(btn, color_code: str) -> None:
     badge = preset["badge"]
     clean_text = strip_color_badge(btn.text)
     btn.text = f"{badge} {clean_text}"
-    # پشتیبانی از فیلد استایل رنگ دکمه در Bot API جدید در صورت وجود
     try:
         if preset.get("tg_style"):
             object.__setattr__(btn, "style", preset["tg_style"])
@@ -264,12 +279,10 @@ def process_reply_markup(markup):
                 for btn in row:
                     orig_clean = strip_color_badge(btn.text)
                     cb_data = getattr(btn, "callback_data", "") or ""
-                    # 1. تغییر نام دکمه
                     if btn.text in renames:
                         btn.text = renames[btn.text]
                     elif orig_clean in renames:
                         btn.text = renames[orig_clean]
-                    # 2. اعمال رنگ دکمه (بر اساس callback_data یا متن دکمه)
                     matched_color = colors.get(cb_data) or colors.get(orig_clean) or colors.get(strip_color_badge(btn.text))
                     if matched_color:
                         _apply_color_to_btn(btn, matched_color)
