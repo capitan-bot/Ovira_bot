@@ -1,1 +1,1 @@
-from adapters import ovira, sanaei  # noqa: F401
+from adapters import marzban, ovira, sanaei  # noqa: F401

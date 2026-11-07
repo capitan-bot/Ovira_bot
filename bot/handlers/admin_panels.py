@@ -26,6 +26,8 @@ TYPE_LABEL = {
     PanelType.PANEL_ONE: "OpenVPN / WireGuard",
     PanelType.OVIRA: "اویرا (OpenVPN / WireGuard)",
     PanelType.SANAEI: "سنایی (3x-ui)",
+    PanelType.MARZBAN: "مرزبان (Marzban)",
+    PanelType.REBECCA: "ربکا (Rebecca)",
 }
 CONN_LABEL = {
     ConnStatus.UNKNOWN: "⚪️ بررسی نشده",
@@ -165,6 +167,8 @@ async def add_name(message: Message, state: FSMContext):
         reply_markup=kb(
             [("🟣 اویرا (OpenVPN / WireGuard)", "adm:pat:ovira")],
             [("🔵 سنایی (3x-ui)", "adm:pat:sanaei")],
+            [("🟠 مرزبان (Marzban)", "adm:pat:marzban")],
+            [("🟡 ربکا (Rebecca) - آزمایشی", "adm:pat:rebecca")],
             [("🔙 انصراف", "adm:pn")],
         ),
     )
@@ -179,7 +183,7 @@ async def add_type(cb: CallbackQuery, state: FSMContext):
     await state.update_data(action="padd_url", ptype=cb.data.split(":")[2])
     await edit_or_answer(
         cb,
-        "🌐 آدرس کامل پنل را بفرستید (با پورت و مسیر مخفی؛ مثال: https://capi.aligater.ir:4000/yJydgYFDuaEYVtIhTk):",
+        "🌐 آدرس کامل پنل را بفرستید (با پورت و مسیر مخفی؛ مثال: https://panel.example.com:4000/secretpath):",
         kb([("🔙 انصراف", "adm:pn")]),
     )
     await cb.answer()

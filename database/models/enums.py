@@ -7,6 +7,8 @@ class PanelType(str, enum.Enum):
     OVIRA = "ovira"
     PASARGAD = "pasargad"
     PASARGUARD = "pasarguard"
+    MARZBAN = "marzban"
+    REBECCA = "rebecca"
 
 
 class ConnStatus(str, enum.Enum):
