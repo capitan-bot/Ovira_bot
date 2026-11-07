@@ -79,7 +79,7 @@
 روی یک سرور **Ubuntu/Debian** با دسترسی **root** فقط همین یک خط رو بزن:
 
 ```bash
-apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/capitan-bot/Ovira_bot/main/install.sh)
+apt-get update -y && apt-get install -y git curl && { [ -d /opt/capitan/.git ] && git -C /opt/capitan pull --ff-only || git clone https://github.com/capitan-bot/Ovira_bot.git /opt/capitan; } && bash /opt/capitan/menu.sh
 ```
 
 نصب‌کننده خودش Docker و ابزارها رو نصب می‌کنه، ریپو رو توی `/opt/capitan` می‌ذاره و این‌ها رو می‌پرسه:
