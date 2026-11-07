@@ -1,0 +1,11 @@
+.env
+storage/
+backup/
+backup6/
+*.bak
+*.bak2
+*.bak3
+*.bak4
+*.zip
+__pycache__/
+*.pyc

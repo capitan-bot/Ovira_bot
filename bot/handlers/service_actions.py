@@ -1,0 +1,551 @@
+"""
+Customer service management: renew (extra GB / days, paid from wallet), QR codes, on/off,
+new link (delete + recreate with the remaining volume), full deletion with a reason (admins get a report).
+
+DB rule used here: panel calls are slow, so money/state writes go through their own short session_scope();
+the per-update middleware session is only used for reads (and for simple status flips that never overlap).
+"""
+import asyncio
+import logging
+import re
+import uuid
+
+from aiogram import Bot, F, Router
+from aiogram.filters import StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
+
+from adapters.base import CreateUserRequest, PanelError
+from backend.services.errors import DomainError, InsufficientFunds
+from backend.services.service_ops import (
+    aware, check_renewal_input, gb_to_bytes, load_service_for_user, new_expiry, refund_renewal,
+    remaining_bytes, renewal_price, reserve_renewal,
+)
+from backend.services.shop import GB, adapter_available, adapter_for, apply_remote, inbound_ids, unpack_files
+from backend.services.users import audit, get_wallet
+from bot.delivery import notify_admins, send_files, user_lock
+from bot.keyboards.shop import kb
+from bot.qr import file_text_for_qr, make_qr
+from bot.logger_group import notify_log
+from bot.service_view import detail
+from bot.states.service import DeleteStates, RenewStates
+from bot.utils import _DIGITS, edit_or_answer, fmt_dt, fmt_money
+from database.base import utcnow
+from database.connection import session_scope
+from database.models import Panel, Service, ServiceProfile, ServiceStatus
+
+log = logging.getLogger(__name__)
+router = Router()
+
+
+def _int0(text: str) -> int | None:
+    """Strict whole number, 0 allowed."""
+    t = (text or "").strip().translate(_DIGITS)
+    return int(t) if re.fullmatch(r"\d{1,6}", t) else None
+
+
+def _sid(cb: CallbackQuery) -> int:
+    return int(cb.data.split(":")[2])
+
+
+def _back(sid: int):
+    return [("🔙 بازگشت به سرویس", f"svc:v:{sid}")]
+
+
+def _days_left(svc_expires) -> int:
+    return max(0, (aware(svc_expires) - utcnow()).days)
+
+
+async def _own(session, sid: int, user_id: int) -> Service | None:
+    try:
+        return await load_service_for_user(session, sid, user_id)
+    except DomainError:
+        return None
+
+
+async def _fetch_files(svc: Service, panel: Panel):
+    files, link = [], svc.subscription_link
+    try:
+        remote = await adapter_for(panel).get_user(svc.username)
+        files, link = remote.config_files, remote.subscription_link or link
+    except PanelError as e:
+        log.warning("file fetch for service %s failed: %s", svc.id, e)
+        files = unpack_files(svc.config_blob_enc)
+    return files, link
+
+
+# =====================================================================
+# on / off
+# =====================================================================
+@router.callback_query(F.data.regexp(r"^svc:t:\d+$"))
+async def toggle(cb: CallbackQuery, session, db_user):
+    svc = await _own(session, _sid(cb), db_user.id)
+    if svc is None:
+        await cb.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    if svc.status not in (ServiceStatus.ACTIVE, ServiceStatus.DISABLED):
+        await cb.answer("این سرویس منقضی شده یا حجمش تمام شده است. ابتدا تمدید کنید.", show_alert=True)
+        return
+    panel = await session.get(Panel, svc.panel_id)
+    lock = user_lock(db_user.id)
+    if lock.locked():
+        await cb.answer("درخواست قبلی شما در حال پردازش است.", show_alert=True)
+        return
+    enable = svc.status == ServiceStatus.DISABLED
+    async with lock:
+        try:
+            await adapter_for(panel).set_enabled(svc.username, enable)
+        except PanelError as e:
+            log.warning("toggle of service %s failed: %s", svc.id, e)
+            await cb.answer("تغییر وضعیت روی سرور انجام نشد. کمی بعد دوباره امتحان کنید.", show_alert=True)
+            return
+        svc.status = ServiceStatus.ACTIVE if enable else ServiceStatus.DISABLED
+        await audit(session, f"user:{db_user.telegram_id}", "service.enable" if enable else "service.disable",
+                    target=f"service:{svc.id}")
+    text, markup = detail(svc, panel.display_name)
+    await edit_or_answer(cb, text, markup)
+    await cb.answer("روشن شد ▶️" if enable else "خاموش شد ⏸")
+
+
+# =====================================================================
+# QR codes
+# =====================================================================
+@router.callback_query(F.data.regexp(r"^svc:q:\d+$"))
+async def qr_codes(cb: CallbackQuery, session, db_user, bot: Bot):
+    svc = await _own(session, _sid(cb), db_user.id)
+    if svc is None:
+        await cb.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    panel = await session.get(Panel, svc.panel_id)
+    await cb.answer("در حال ساخت QR ...")
+    files, link = await _fetch_files(svc, panel)
+    chat = cb.message.chat.id
+    sent, skipped = 0, 0
+    if link:
+        png = await make_qr(link)
+        if png:
+            await bot.send_photo(chat, BufferedInputFile(png, filename="sub.png"), caption="📷 QR لینک اشتراک")
+            sent += 1
+    for f in files:
+        text = file_text_for_qr(f.content)
+        png = await make_qr(text) if text else None
+        if png is None:
+            skipped += 1
+            continue
+        await bot.send_photo(chat, BufferedInputFile(png, filename="qr.png"), caption=f"📷 QR کانفیگ: {f.filename}")
+        sent += 1
+    if skipped:
+        await bot.send_message(chat, "ℹ️ کانفیگ‌های بزرگ (مثل فایل OpenVPN) QR کد ندارند. از «📥 دریافت کانفیگ / لینک اشتراک» فایل را بگیرید.")
+    if not sent:
+        await bot.send_message(chat, "⚠️ برای این سرویس QR کدی قابل ساخت نبود. از «📥 دریافت کانفیگ / لینک اشتراک» استفاده کنید.")
+
+
+# =====================================================================
+# renew: extra GB and/or extra days
+# =====================================================================
+@router.callback_query(F.data.regexp(r"^svc:x:\d+$"))
+async def renew_start(cb: CallbackQuery, session, state: FSMContext, db_user):
+    sid = _sid(cb)
+    svc = await _own(session, sid, db_user.id)
+    if svc is None:
+        await cb.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    panel = await session.get(Panel, svc.panel_id)
+    if svc.is_test:
+        await cb.answer("سرویس تست قابل تمدید نیست. یک اشتراک جدید بخرید.", show_alert=True)
+        return
+    if panel is None or not panel.is_active or not adapter_available(panel):
+        await cb.answer("پنل این سرویس در حال حاضر در دسترس نیست.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(RenewStates.gb)
+    await state.set_data({"sid": sid})
+    await edit_or_answer(
+        cb,
+        f"➕ تمدید / حجم اضافه — {svc.username}\n\n"
+        f"💰 قیمت هر گیگابایت: {fmt_money(panel.price_per_gb)} تومان\n"
+        f"📅 هزینه هر روز: {fmt_money(panel.price_per_day)} تومان\n\n"
+        f"💾 چند گیگابایت حجم اضافه می‌خواهید؟ (عدد بفرستید؛ اگر حجم اضافه نمی‌خواهید 0)\n"
+        f"حداکثر {panel.max_gb} گیگابایت",
+        kb(_back(sid)))
+    await cb.answer()
+
+
+@router.message(RenewStates.gb, F.text, ~F.text.startswith("/"))
+async def renew_gb(message: Message, session, state: FSMContext):
+    data = await state.get_data()
+    svc = await session.get(Service, data["sid"])
+    panel = await session.get(Panel, svc.panel_id)
+    gb = _int0(message.text)
+    if gb is None or gb > panel.max_gb:
+        await message.answer(f"❌ یک عدد صحیح بین 0 و {panel.max_gb} بفرستید.")
+        return
+    await state.update_data(gb=gb)
+    await state.set_state(RenewStates.days)
+    await message.answer(
+        f"📅 چند روز مدت اضافه می‌خواهید؟ (عدد بفرستید؛ اگر مدت اضافه نمی‌خواهید 0)\nحداکثر {panel.max_days} روز",
+        reply_markup=kb(_back(svc.id)))
+
+
+@router.message(RenewStates.days, F.text, ~F.text.startswith("/"))
+async def renew_days(message: Message, session, state: FSMContext, db_user):
+    data = await state.get_data()
+    svc = await session.get(Service, data["sid"])
+    panel = await session.get(Panel, svc.panel_id)
+    days, gb = _int0(message.text), data["gb"]
+    if days is None or days > panel.max_days:
+        await message.answer(f"❌ یک عدد صحیح بین 0 و {panel.max_days} بفرستید.")
+        return
+    err = check_renewal_input(panel, gb, days)
+    if err:
+        await message.answer(f"❌ {err} عدد مدت را دوباره بفرستید.")
+        return
+    if days == 0 and aware(svc.expires_at) <= utcnow():
+        await message.answer("❌ این سرویس منقضی شده است؛ برای فعال شدن دوباره حداقل یک روز مدت اضافه انتخاب کنید.")
+        return
+    price = renewal_price(panel, gb, days)
+    balance = (await get_wallet(session, db_user.id)).balance
+    key = uuid.uuid4().hex
+    exp = new_expiry(svc.expires_at, days)
+    await state.set_state(None)
+    await state.update_data(days=days, renew_key=key)
+    text = (
+        "🧾 خلاصه تمدید\n\n"
+        f"👤 سرویس: {svc.username}\n"
+        f"💾 حجم اضافه: {gb} گیگابایت\n"
+        f"📅 مدت اضافه: {days} روز\n"
+        f"⏳ انقضای جدید: {fmt_dt(exp)}\n\n"
+        f"💰 مبلغ: {fmt_money(price)} تومان\n"
+        f"💳 موجودی شما: {fmt_money(balance)} تومان"
+    )
+    if balance >= price:
+        await message.answer(text, reply_markup=kb([("✅ تأیید و پرداخت از کیف پول", "svc:xy")], _back(svc.id)))
+    else:
+        await message.answer(f"{text}\n\n❌ موجودی کافی نیست. کمبود: {fmt_money(price - balance)} تومان",
+                             reply_markup=kb([("💳 شارژ کیف پول", "wallet:charge")], _back(svc.id)))
+
+
+@router.message(StateFilter(RenewStates.gb, RenewStates.days, DeleteStates.reason))
+async def wrong_input(message: Message):
+    await message.answer("لطفاً پیام متنی بفرستید. (انصراف: /cancel)")
+
+
+@router.callback_query(F.data == "svc:xy")
+async def renew_go(cb: CallbackQuery, state: FSMContext, db_user, bot: Bot):
+    data = await state.get_data()
+    key = data.get("renew_key")
+    if not key or "days" not in data:
+        await cb.answer("این درخواست منقضی شده است. دوباره از «سرویس‌های من» شروع کنید.", show_alert=True)
+        return
+    await state.clear()
+    lock = user_lock(db_user.id)
+    if lock.locked():
+        await cb.answer("درخواست قبلی شما در حال پردازش است.", show_alert=True)
+        return
+    async with lock:
+        await cb.answer()
+        await _renew(cb, bot, db_user, data["sid"], data["gb"], data["days"], key)
+
+
+async def _renew(cb: CallbackQuery, bot: Bot, user, sid: int, gb: int, days: int, key: str) -> None:
+    # Phase 1 (own transaction): validate + debit.
+    try:
+        async with session_scope() as s:
+            price, panel = await reserve_renewal(s, user_id=user.id, service_id=sid, gb=gb, days=days, key=key)
+            svc = await s.get(Service, sid)
+            username = svc.username
+            current_exp = svc.expires_at
+    except InsufficientFunds:
+        await edit_or_answer(cb, "❌ موجودی کیف پول کافی نیست.",
+                             kb([("💳 شارژ کیف پول", "wallet:charge")], _back(sid)))
+        return
+    except DomainError as e:
+        await edit_or_answer(cb, f"❌ {e}", kb(_back(sid)))
+        return
+
+    await edit_or_answer(cb, "⏳ پرداخت انجام شد. در حال تمدید روی سرور ...", None)
+
+    # Phase 2: the panel.
+    adapter = adapter_for(panel)
+    try:
+        before = await adapter.get_user(username)
+        exp = new_expiry(before.expires_at or current_exp, days)
+        await adapter.renew(username, gb_to_bytes(gb), exp)
+        remote = await adapter.get_user(username)
+    except Exception as e:  # noqa: BLE001 - every failure must end in a refund
+        err = str(e) if isinstance(e, PanelError) else f"{type(e).__name__}: {e}"
+        log.exception("renewal of service %s failed", sid)
+        try:
+            async with session_scope() as s:
+                balance = await refund_renewal(s, user_id=user.id, service_id=sid, key=key, price=price)
+                await audit(s, f"user:{user.telegram_id}", "service.renew_failed", target=f"service:{sid}",
+                            details={"error": err[:300]})
+        except Exception:  # noqa: BLE001
+            log.exception("REFUND FAILED for renewal of service %s", sid)
+            await notify_admins(bot, f"🚨 بازگشت وجه تمدید ناموفق انجام نشد!\nسرویس #{sid} ({username}) | کاربر {user.telegram_id}"
+                                     f"\nمبلغ: {fmt_money(price)} تومان\n{err[:300]}")
+            await edit_or_answer(cb, "⚠️ تمدید انجام نشد و بازگشت خودکار وجه با مشکل روبه‌رو شد. "
+                                     "به پشتیبانی پیام بدهید؛ مبلغ شما محفوظ است.", kb(_back(sid)))
+            return
+        await edit_or_answer(cb, f"❌ تمدید انجام نشد (مشکل در ارتباط با سرور). مبلغ به کیف پول شما برگشت.\n"
+                                 f"💰 موجودی: {fmt_money(balance)} تومان", kb(_back(sid)))
+        await notify_admins(bot, f"⚠️ تمدید ناموفق (وجه برگشت داده شد)\nسرویس #{sid} ({username}) | کاربر {user.telegram_id}"
+                                 f"\nپنل: {panel.display_name} | +{gb}GB +{days} روز\nخطا: {err[:400]}\n"
+                                 "اگر خطا درباره‌ی تاریخ انقضا بود، سرویس را روی پنل بررسی کنید.")
+        return
+
+    # Phase 3: save the new numbers.
+    saved = True
+    try:
+        async with session_scope() as s:
+            svc = await s.get(Service, sid)
+            apply_remote(svc, remote)
+            svc.purchased_days += days
+            svc.notified_expiry = False
+            svc.notified_depleted = False
+            await audit(s, f"user:{user.telegram_id}", "service.renewed", target=f"service:{sid}",
+                        details={"gb": gb, "days": days, "price": price})
+    except Exception:  # noqa: BLE001
+        saved = False
+        log.exception("renewal of service %s done on the panel but not saved", sid)
+        await notify_admins(bot, f"🚨 تمدید روی پنل انجام شد ولی در دیتابیس ثبت نشد!\nسرویس #{sid} ({username}) | کاربر {user.telegram_id}")
+
+    total_gb = (remote.total_bytes or 0) / GB
+    await edit_or_answer(
+        cb,
+        "✅ تمدید با موفقیت انجام شد.\n\n"
+        f"👤 سرویس: {username}\n"
+        f"➕ اضافه شد: {gb} گیگابایت و {days} روز\n"
+        f"💾 حجم کل: {total_gb:.2f} گیگابایت\n"
+        f"⏳ انقضا: {fmt_dt(remote.expires_at)}"
+        + ("" if saved else "\n\n⚠️ ثبت در لیست شما با تأخیر انجام می‌شود."),
+        kb([("📦 سرویس من", f"svc:v:{sid}")], [("🏠 منو", "menu:main")]))
+
+
+# =====================================================================
+# new link: delete on the panel, recreate with the REMAINING volume and the same end date
+# =====================================================================
+@router.callback_query(F.data.regexp(r"^svc:n:\d+$"))
+async def newlink_ask(cb: CallbackQuery, session, db_user):
+    svc = await _own(session, _sid(cb), db_user.id)
+    if svc is None:
+        await cb.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    left = remaining_bytes(svc.total_bytes, svc.used_bytes) / GB
+    await edit_or_answer(
+        cb,
+        f"🔁 دریافت لینک جدید — {svc.username}\n\n"
+        "سرویس فعلی از روی سرور حذف می‌شود و یک سرویس تازه با همین نام ساخته می‌شود.\n"
+        f"💾 حجم باقی‌مانده (تقریباً): {left:.2f} گیگابایت\n"
+        f"⏳ انقضا: {fmt_dt(svc.expires_at)}\n\n"
+        "⚠️ لینک و کانفیگ قبلی دیگر کار نمی‌کند و باید لینک/فایل جدید را در برنامه‌تان وارد کنید.\n"
+        "ادامه می‌دهید؟",
+        kb([("✅ بله، لینک جدید بساز", f"svc:ny:{svc.id}")], _back(svc.id)))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^svc:ny:\d+$"))
+async def newlink_go(cb: CallbackQuery, db_user, bot: Bot):
+    sid = _sid(cb)
+    lock = user_lock(db_user.id)
+    if lock.locked():
+        await cb.answer("درخواست قبلی شما در حال پردازش است.", show_alert=True)
+        return
+    async with lock:
+        await cb.answer()
+        await _newlink(cb, bot, db_user, sid)
+
+
+async def _newlink(cb: CallbackQuery, bot: Bot, user, sid: int) -> None:
+    back = kb(_back(sid))
+    try:
+        async with session_scope() as s:
+            svc = await load_service_for_user(s, sid, user.id)
+            panel = await s.get(Panel, svc.panel_id)
+            profile = await s.get(ServiceProfile, svc.profile_id) if svc.profile_id else None
+            username, cached_total, cached_exp = svc.username, svc.total_bytes, svc.expires_at
+            if panel is None or not panel.is_active or not adapter_available(panel):
+                raise DomainError("پنل این سرویس در حال حاضر در دسترس نیست.")
+            ids = inbound_ids(profile) if profile else []
+            if not ids:
+                raise DomainError("برای این سرویس امکان ساخت لینک جدید وجود ندارد. به پشتیبانی پیام بدهید.")
+            settings = dict(profile.settings or {})
+            adapter = adapter_for(panel)
+    except DomainError as e:
+        await edit_or_answer(cb, f"❌ {e}", back)
+        return
+
+    await edit_or_answer(cb, "⏳ در حال ساخت لینک جدید ...", None)
+    try:
+        before = await adapter.get_user(username)
+    except PanelError as e:
+        log.warning("newlink: get_user failed for service %s: %s", sid, e)
+        await edit_or_answer(cb, "⚠️ اتصال به سرور برقرار نشد. کمی بعد دوباره تلاش کنید. (چیزی تغییر نکرد)", back)
+        return
+
+    total = before.total_bytes or cached_total
+    unlimited = not total
+    remaining = 0 if unlimited else remaining_bytes(total, before.used_bytes)
+    expires = before.expires_at or cached_exp
+    if not unlimited and remaining <= 0:
+        await edit_or_answer(cb, "❌ حجم این سرویس تمام شده و حجمی برای انتقال نمانده است. ابتدا تمدید کنید.", back)
+        return
+    if aware(expires) <= utcnow():
+        await edit_or_answer(cb, "❌ این سرویس منقضی شده است. ابتدا تمدید کنید.", back)
+        return
+
+    req = CreateUserRequest(username=username, total_bytes=remaining, expires_at=expires,
+                            inbound_ids=ids, settings=settings)
+    try:
+        await adapter.delete_user(username)
+    except PanelError as e:
+        log.warning("newlink: delete failed for service %s: %s", sid, e)
+        await edit_or_answer(cb, "⚠️ حذف سرویس قبلی روی سرور انجام نشد. (چیزی تغییر نکرد) کمی بعد دوباره تلاش کنید.", back)
+        return
+
+    new, last_err = None, ""
+    for attempt in range(3):                       # the old user is already gone: do not give up on the first error
+        try:
+            new = await adapter.create_user(req)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e) if isinstance(e, PanelError) else f"{type(e).__name__}: {e}"
+            log.exception("newlink: create attempt %s for service %s failed", attempt + 1, sid)
+            await asyncio.sleep(2)
+    if new is None:
+        await notify_admins(
+            bot, f"🚨 تعویض لینک نیمه‌کاره ماند! سرویس قبلی حذف شد ولی ساخت جدید ناموفق بود.\n"
+                 f"سرویس #{sid} | نام: {username} | کاربر {user.telegram_id}\nپنل: {panel.display_name}\n"
+                 f"حجم باقی‌مانده: {remaining / GB:.2f} GB | انقضا: {fmt_dt(expires)}\nخطا: {last_err[:300]}\n"
+                 "لطفاً دستی با همین مشخصات روی پنل بسازید.")
+        await edit_or_answer(cb, "⚠️ ساخت لینک جدید با مشکل روبه‌رو شد. حجم و مدت شما محفوظ است؛ "
+                                 "به پشتیبانی پیام بدهید تا سریع برایتان ساخته شود.", back)
+        return
+
+    saved = True
+    try:
+        async with session_scope() as s:
+            svc = await s.get(Service, sid)
+            svc.remote_id = new.remote_id
+            svc.total_bytes = new.total_bytes or remaining
+            svc.used_bytes = 0
+            apply_remote(svc, new)
+            svc.status = ServiceStatus.ACTIVE if new.enabled else ServiceStatus.DISABLED
+            svc.notified_expiry = False
+            svc.notified_depleted = False
+            await audit(s, f"user:{user.telegram_id}", "service.newlink", target=f"service:{sid}",
+                        details={"remaining_gb": round(remaining / GB, 2)})
+    except Exception:  # noqa: BLE001
+        saved = False
+        log.exception("newlink for service %s created on the panel but not saved", sid)
+        await notify_admins(bot, f"🚨 لینک جدید روی پنل ساخته شد ولی در دیتابیس ثبت نشد!\nسرویس #{sid} ({username}) | کاربر {user.telegram_id}")
+
+    await edit_or_answer(
+        cb,
+        "✅ لینک جدید ساخته شد. لینک و کانفیگ قبلی دیگر کار نمی‌کند.\n\n"
+        f"👤 نام: {username}\n"
+        f"💾 حجم: {'نامحدود' if unlimited else f'{remaining / GB:.2f} گیگابایت'}\n"
+        f"⏳ انقضا: {fmt_dt(new.expires_at or expires)}"
+        + ("" if saved else "\n\n⚠️ ثبت در لیست شما با تأخیر انجام می‌شود."),
+        kb([("📦 سرویس من", f"svc:v:{sid}")], [("🏠 منو", "menu:main")]))
+    if not await send_files(bot, cb.message.chat.id, new.config_files, new.subscription_link):
+        await bot.send_message(cb.message.chat.id, "ℹ️ سرور فایل کانفیگ برنگرداند. از «سرویس‌های من ← دریافت کانفیگ» امتحان کنید.")
+
+
+# =====================================================================
+# delete (reason first, then confirm, then report to the admins)
+# =====================================================================
+@router.callback_query(F.data.regexp(r"^svc:d:\d+$"))
+async def delete_start(cb: CallbackQuery, session, state: FSMContext, db_user):
+    sid = _sid(cb)
+    svc = await _own(session, sid, db_user.id)
+    if svc is None:
+        await cb.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(DeleteStates.reason)
+    await state.set_data({"sid": sid})
+    await edit_or_answer(cb, f"🗑 حذف سرویس — {svc.username}\n\nلطفاً دلیل حذف سرویس را بنویسید و بفرستید:",
+                         kb(_back(sid)))
+    await cb.answer()
+
+
+@router.message(DeleteStates.reason, F.text, ~F.text.startswith("/"))
+async def delete_reason(message: Message, session, state: FSMContext, db_user):
+    data = await state.get_data()
+    reason = message.text.strip()[:300]
+    if len(reason) < 2:
+        await message.answer("❌ دلیل خیلی کوتاه است. لطفاً توضیح بدهید.")
+        return
+    svc = await _own(session, data["sid"], db_user.id)
+    if svc is None:
+        await state.clear()
+        await message.answer("سرویس پیدا نشد.")
+        return
+    await state.set_state(None)
+    await state.update_data(reason=reason)
+    left = remaining_bytes(svc.total_bytes, svc.used_bytes) / GB
+    await message.answer(
+        f"⚠️ حذف کامل سرویس {svc.username}\n\n"
+        f"💾 حجم باقی‌مانده: {left:.2f} گیگابایت | ⏳ {_days_left(svc.expires_at)} روز مانده\n"
+        f"📝 دلیل: {reason}\n\n"
+        "این کار برگشت‌پذیر نیست و وجهی بابت حجم یا روزهای باقی‌مانده بازگردانده نمی‌شود. مطمئنید؟",
+        reply_markup=kb([("🗑 بله، برای همیشه حذف شود", f"svc:dy:{svc.id}")], _back(svc.id)))
+
+
+@router.callback_query(F.data.regexp(r"^svc:dy:\d+$"))
+async def delete_go(cb: CallbackQuery, state: FSMContext, db_user, bot: Bot):
+    sid = _sid(cb)
+    data = await state.get_data()
+    if data.get("sid") != sid or not data.get("reason"):
+        await cb.answer("این درخواست منقضی شده است. دوباره از «سرویس‌های من» شروع کنید.", show_alert=True)
+        return
+    reason = data["reason"]
+    await state.clear()
+    lock = user_lock(db_user.id)
+    if lock.locked():
+        await cb.answer("درخواست قبلی شما در حال پردازش است.", show_alert=True)
+        return
+    async with lock:
+        await cb.answer()
+        try:
+            async with session_scope() as s:
+                svc = await load_service_for_user(s, sid, db_user.id)
+                panel = await s.get(Panel, svc.panel_id)
+                info = dict(username=svc.username, is_test=svc.is_test, used=svc.used_bytes, total=svc.total_bytes,
+                            exp=svc.expires_at, panel_name=panel.display_name if panel else "—")
+                adapter = adapter_for(panel) if panel else None
+        except DomainError as e:
+            await edit_or_answer(cb, f"❌ {e}", kb([("🔙 سرویس‌ها", "menu:services")]))
+            return
+        if adapter is None:
+            await edit_or_answer(cb, "❌ پنل این سرویس پیدا نشد. به پشتیبانی پیام بدهید.", kb(_back(sid)))
+            return
+        try:
+            await adapter.delete_user(info["username"])
+        except PanelError as e:
+            log.warning("delete of service %s failed on the panel: %s", sid, e)
+            await edit_or_answer(cb, "⚠️ حذف روی سرور انجام نشد. (سرویس شما دست‌نخورده است) کمی بعد دوباره تلاش کنید.",
+                                 kb(_back(sid)))
+            return
+        try:
+            async with session_scope() as s:
+                svc = await s.get(Service, sid)
+                svc.status = ServiceStatus.DELETED
+                await audit(s, f"user:{db_user.telegram_id}", "service.delete", target=f"service:{sid}",
+                            details={"reason": reason, "username": info["username"]})
+        except Exception:  # noqa: BLE001
+            log.exception("service %s deleted on the panel but status not saved", sid)
+        name = " ".join(x for x in (db_user.first_name, db_user.last_name) if x) or "—"
+        report = (
+            "🗑 گزارش حذف سرویس توسط مشتری\n\n"
+            f"👤 {name} | {('@' + db_user.username) if db_user.username else '—'} | {db_user.telegram_id}\n"
+            f"📦 سرویس: {info['username']}{' (تست)' if info['is_test'] else ''}\n"
+            f"🛰 پنل: {info['panel_name']}\n"
+            f"📊 مصرف: {info['used'] / GB:.2f} از {info['total'] / GB:.2f} گیگابایت\n"
+            f"⏳ انقضا: {fmt_dt(info['exp'])}\n\n"
+            f"📝 دلیل: {reason}")
+        await notify_admins(bot, report)
+        await notify_log(bot, "delete", report)
+        await edit_or_answer(cb, f"🗑 سرویس {info['username']} حذف شد.\nممنون از بازخوردتان.",
+                             kb([("📦 سرویس‌های من", "menu:services")], [("🏠 منو", "menu:main")]))
