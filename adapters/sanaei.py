@@ -124,7 +124,7 @@ class SanaeiAdapter(PanelAdapter):
         super().__init__(creds)
         raw_url = creds.api_url.rstrip("/")
         parsed = urlparse(raw_url)
-        self.host = parsed.hostname or "capi.aligater.ir"
+        self.host = parsed.hostname or "localhost"
         self.scheme = parsed.scheme or "https"
         self.port = parsed.port or 4000
         base_path = parsed.path.rstrip("/")

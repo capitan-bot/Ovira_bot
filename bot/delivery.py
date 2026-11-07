@@ -17,6 +17,13 @@ from config.settings import get_settings
 log = logging.getLogger(__name__)
 _locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+import re as _re
+_CFG_LINE = _re.compile(r"^(vmess|vless|trojan|ss|ssr|hysteria2|hysteria|hy2|tuic)://\S+$", _re.I)
+
+
+def _cfg_lines(text: str) -> list[str]:
+    return [ln.strip() for ln in text.splitlines() if _CFG_LINE.match(ln.strip())]
+
 
 def user_lock(user_id: int) -> asyncio.Lock:
     return _locks[user_id]
@@ -102,12 +109,14 @@ async def _links_from_sub(url: str) -> list[str]:
     """Reads the panel's own subscription page and returns the config links inside it."""
     try:
         async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as c:
-            r = await c.get(url)
+            r = await c.get(url, headers={"User-Agent": "v2rayN/6.42"})
         if r.status_code != 200:
             return []
         body = r.text.strip()
     except Exception as e:  # noqa: BLE001
         log.warning("reading subscription page failed: %s", type(e).__name__)
+        return []
+    if body.lstrip().startswith("<"):
         return []
     if "://" not in body:
         try:
@@ -115,7 +124,7 @@ async def _links_from_sub(url: str) -> list[str]:
             body = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
         except Exception:  # noqa: BLE001
             return []
-    return [ln.strip() for ln in body.splitlines() if "://" in ln]
+    return _cfg_lines(body)
 
 
 async def send_files(bot: Bot, chat_id: int, files: list[ConfigFile], sub_link: str | None) -> bool:
@@ -128,7 +137,7 @@ async def send_files(bot: Bot, chat_id: int, files: list[ConfigFile], sub_link: 
             text = f.content.decode("utf-8")
         except Exception:  # noqa: BLE001
             text = ""
-        found = [ln.strip() for ln in text.splitlines() if "://" in ln]
+        found = _cfg_lines(text)
         if found:
             links += found
         else:

@@ -553,3 +553,8 @@ class SanaeiAdapter(PanelAdapter):
                     "sniffing": obj.get("sniffing", "{}"),
                 }
                 await self._request("POST", f"inbounds/update/{ib_id}", json=payload)
+
+
+# 3x-ui v3 modern API (clients/add, clients/links)
+from adapters.sanaei_v3 import install as _install_v3  # noqa: E402
+_install_v3(SanaeiAdapter, ALLOWED_INBOUND_IDS)

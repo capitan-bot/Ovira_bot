@@ -6,8 +6,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from backend.services.invoices import expire_old_invoices
+from bot.emoji_manager import AutoPremiumEmojiMiddleware
 from bot.handlers import (
-    admin, admin_broadcast, admin_panel, admin_panels, admin_profiles, admin_settings, admin_tests, admin_users,
+    admin, admin_emojis, admin_broadcast, admin_panel, admin_panels, admin_profiles, admin_settings, admin_tests, admin_users,
     buy, charge, free_test, menu, my_services, review, service_actions, start,
 )
 from bot.middlewares.db import DbSessionMiddleware
@@ -38,6 +39,7 @@ async def main() -> None:
         raise SystemExit("BOT_TOKEN is empty in .env")
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=None))
+    bot.session.middleware(AutoPremiumEmojiMiddleware())
     dp = Dispatcher(storage=MemoryStorage())  # in-memory FSM: a restart resets half-finished flows
 
     dp.update.outer_middleware(DbSessionMiddleware())
@@ -45,7 +47,7 @@ async def main() -> None:
     # Order matters: buy / free_test / my_services must come before menu (menu still holds the
     # "coming soon" fallback for sections that are not built yet, e.g. support).
     dp.include_routers(
-        admin.router, admin_panel.router, admin_users.router, admin_panels.router, admin_profiles.router,
+        admin.router, admin_emojis.router, admin_panel.router, admin_users.router, admin_panels.router, admin_profiles.router,
         admin_tests.router,   # before admin_settings: it takes over the free-test buttons
         admin_settings.router, admin_broadcast.router,
         review.router, start.router, charge.router,
