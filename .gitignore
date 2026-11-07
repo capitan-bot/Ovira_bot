@@ -17,3 +17,11 @@ backup_final/
 storage/*.db
 .env
 __pycache__/
+*.bak
+*.bak2
+*.bak3
+*.bak4
+backup_final/
+storage/*.db
+.env
+__pycache__/
