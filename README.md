@@ -1,81 +1,133 @@
-# CAPITAN VPN — Stage 1: Database & Architecture
+<div dir="rtl" align="right">
 
-## What's in this stage
-- Project skeleton (bot / backend / adapters / admin / database / workers)
-- PostgreSQL schema (SQLAlchemy 2.0 async) + Alembic baseline migration
-- Atomic wallet ledger (row lock + idempotency keys) — `backend/services/wallet.py`
-- Invoices with unique payable amount (DB partial unique index) and
-  once-only receipt approval — `backend/services/invoices.py`
-- Fernet encryption for panel credentials and stored config files — `config/crypto.py`
-- Panel adapter contract (`adapters/base.py`). **Real adapters come in stages 4–5.**
-- Idempotent seed for editable settings (card info, texts, test limits)
-- Tests (wallet, invoices, crypto)
+# 🚢 CAPITAN VPN Bot
 
-## Quick setup
+ربات تلگرام برای **فروش و مدیریت سرویس VPN**؛ با نصب خودکار، پرداخت کارت‌به‌کارت، تست رایگان و پنل مدیریت کامل داخل تلگرام.
+
+## ✨ امکانات
+
+**👤 برای کاربران**
+- 🛒 خرید سرویس با انتخاب پنل، حجم و مدت
+- 💳 شارژ کیف پول و پرداخت کارت‌به‌کارت با ارسال رسید
+- 🎁 دریافت تست رایگان
+- 📦 مدیریت سرویس‌ها: تمدید، دریافت لینک جدید، خاموش و روشن کردن، حذف سرویس
+- 📷 دریافت QR کد و لینک اشتراک (Subscription) با دکمهٔ کپی
+- ⭐️ ثبت امتیاز و نظر
+- 🤝 سیستم دعوت (رفرال)
+
+**🛠 برای ادمین**
+- 🛰 افزودن و مدیریت پنل‌ها و پروفایل‌ها از داخل ربات
+- ✅ بررسی و تأیید رسیدهای پرداخت
+- 👥 مدیریت کاربران، کیف پول و مسدودسازی
+- 🎁 تنظیم تست رایگان (حجم، مدت، تعداد دفعات)
+- 📢 ارسال پیام همگانی
+- 📋 گروه لاگ با تاپیک‌های جدا: تست، حذف سرویس، خرید، خطاها و تغییر کاربران *(اختیاری)*
+
+## 🛰 پنل‌های پشتیبانی‌شده
+- 3x-ui (Sanaei)
+- PasarGuard
+- Ovira
+
+## 📋 پیش‌نیازها
+- 🖥 یک سرور **Ubuntu** (ترجیحاً ۲۲.۰۴ یا ۲۴.۰۴) با دسترسی **root**
+- 🌍 سروری که به **تلگرام** دسترسی داشته باشد
+- 🤖 توکن ربات از [@BotFather](https://t.me/BotFather)
+- 🆔 آیدی عددی خودتان (مثلاً از ربات `@userinfobot`)
+
+Docker و بقیهٔ ابزارها را نصب‌کننده خودش نصب می‌کند.
+
+## 🚀 نصب
+
+روی سرور، با کاربر root این دستور را بزنید:
+
 ```bash
-bash setup.sh   # asks for bot token + admin numeric ID, generates all keys, starts DB
+bash <(curl -fsSL https://raw.githubusercontent.com/capitan-bot/Ovira_bot/main/install.sh)
 ```
 
-## Manual setup
+نصب‌کننده این موارد را می‌پرسد:
+1. 🤖 توکن ربات
+2. 🆔 آیدی عددی ادمین (چند ادمین با کاما جدا شود)
+3. 🏪 نام فروشگاه
+4. 💳 شمارهٔ کارت و نام صاحب کارت *(اختیاری)*
+5. 🎧 آیدی پشتیبانی، مثل `@support` *(اختیاری)*
+6. 📋 آیدی گروه لاگ *(اختیاری)*
+
+رمز دیتابیس و کلیدهای امنیتی به‌صورت تصادفی ساخته می‌شوند و در فایل `/opt/capitan/.env` ذخیره می‌شوند.
+
+بعد از پایان نصب، پیام `Bot started as @...` را در لاگ می‌بینید. وارد ربات شوید و `/start` بزنید.
+
+## ⚙️ بعد از نصب
+1. در ربات دستور `/admin` را بزنید.
+2. 🛰 یک **پنل** اضافه کنید (آدرس کامل پنل با پورت و مسیر مخفی، به‌همراه یوزر و پسورد).
+3. 📦 برای پنل **پروفایل** بسازید (اینباندها و تنظیمات).
+4. 💳 شمارهٔ کارت و متن‌ها را از بخش تنظیمات تکمیل کنید.
+5. 🎁 در صورت نیاز، تست رایگان را فعال کنید.
+
+> 🔗 اگر ساب‌لینک پنل شما پورت یا مسیر غیرپیش‌فرض دارد، باید آدرس پایهٔ ساب برای همان پنل تنظیم شود. اگر خطای مربوط به `sub_base` دیدید، همین مورد است.
+
+## 📋 گروه لاگ (اختیاری)
+۱. یک گروه بسازید و در تنظیمات آن **Topics** را روشن کنید.
+۲. ربات را اضافه و **ادمین** کنید و دسترسی **Manage Topics** را بدهید.
+۳. آیدی گروه (عددی که با `-100` شروع می‌شود) را موقع نصب بدهید، یا در `/opt/capitan/.env` مقدار `LOG_GROUP_ID` را بنویسید و ربات را بالا بیاورید:
+
 ```bash
-cp .env.example .env
-# 1) Revoke the old bot token in @BotFather (/revoke) and paste the NEW one in BOT_TOKEN
-# 2) Generate secrets and paste into .env:
-python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # ENCRYPTION_KEY
-python -c "import secrets;print(secrets.token_urlsafe(48))"                               # JWT_SECRET
-# 3) Use the same strong password in POSTGRES_PASSWORD and DATABASE_URL
-
-docker compose up -d db
-docker compose run --rm migrate      # alembic upgrade head + seed
-```
-**Back up ENCRYPTION_KEY.** Losing it makes stored panel credentials and config files unreadable.
-
-## Tests (local)
-```bash
-pip install -r requirements.txt
-pytest
-```
-Tests use in-memory SQLite. Row locks (`FOR UPDATE`) only take effect on PostgreSQL; the
-production guarantees (unique amount, single approval, non-negative balance) are enforced by
-DB constraints and guarded UPDATEs, which work on both.
-
-## Design decisions
-- Money = integer Toman. The random invoice extra is never credited to the wallet or counted in prices.
-- Wallet changes only through `apply_wallet_change` → one ledger row per change, `CHECK balance >= 0`.
-- Receipt approval is one `UPDATE ... WHERE status='pending' RETURNING`, so double-approval is impossible.
-- Rejected receipt → invoice returns to `pending`, user can resend until it expires.
-- Panel pricing/limits live on the `panels` row; texts/card/test rules live in `settings`. Nothing hard-coded.
-- Config files are stored encrypted, byte-for-byte, with the panel's original filename.
-- Admin IDs come from `ADMIN_TELEGRAM_IDS`; the dashboard login (stage 8) is separate.
-
-## Panel status (honest notes)
-- **Sanaei (3x-ui)**: adapter planned for stage 5; I will verify endpoints against the installed version's API.
-- **Panel one (OpenVPN/WireGuard)**: still need the exact panel name/version to read its real API. No adapter is faked.
-
-## Next: Stage 2 — Telegram bot, main menu, user registration, block middleware
-
----
-## Stage 2 — Telegram bot (added)
-- `bot/main.py` — aiogram 3 polling; notifies admins at startup
-- Middlewares: one DB transaction per update; auto-registration + wallet creation; blocked users stopped; admin flag from `ADMIN_TELEGRAM_IDS`
-- Main menu (5 buttons), wallet view (real balance), other sections show an honest "not active yet"
-- Admin commands in Telegram: `/admin`, `/settings`, `/setcard`, `/setsupport`, `/setshop`; any user: `/id`
-- FSM state is in memory for now (a restart resets half-finished flows).
-
-### Update an existing server
-```bash
-cd /root && unzip -o "capitan_stage2.zip"     # .env is NOT overwritten
-cd capitan
-docker compose run --rm migrate
-docker compose up -d --build bot
-docker compose logs -f bot                   # Ctrl+C to leave logs
+cd /opt/capitan && docker compose up -d --build
 ```
 
----
-## Stage 3 — Wallet top-up (card to card)
-Flow: wallet → charge → amount → invoice (unique payable amount) → receipt photo → admins get photo +
-✅/❌ → approve credits **only the base amount** (once) / reject asks for a reason, user may resend.
-- Admin commands: `/pending`, `/setcharge MIN MAX`, `/setextra MIN MAX`
-- Unpaid invoices expire automatically (every 5 min), freeing their reserved amounts.
-- The same receipt image can't be submitted twice (Telegram `file_unique_id`).
-- Update: `unzip -o capitan_stage3.zip && cd capitan && docker compose run --rm migrate && docker compose up -d --build bot`
+ربات هنگام روشن شدن تاپیک‌ها را خودش می‌سازد.
+
+## 🔄 آپدیت
+
+```bash
+cd /opt/capitan
+git pull
+docker compose up -d --build
+```
+
+## 🛠 دستورات کاربردی
+
+```bash
+cd /opt/capitan
+docker compose ps                  # وضعیت سرویس‌ها
+docker compose logs -f bot         # لاگ زندهٔ ربات
+docker compose restart bot         # ری‌استارت ربات
+docker compose stop bot            # توقف ربات
+```
+
+## 💾 بکاپ و بازگردانی
+
+**بکاپ دیتابیس:**
+
+```bash
+cd /opt/capitan
+docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' | gzip > backup.sql.gz
+cp .env env.backup
+```
+
+**بازگردانی:**
+
+```bash
+cd /opt/capitan
+docker compose stop bot
+gunzip -c backup.sql.gz | docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+docker compose start bot
+```
+
+برای بکاپ خودکار می‌توانید دستور بالا را در `cron` بگذارید.
+
+## 🔐 نکات امنیتی
+- 🚫 فایل `.env` را هیچ‌جا منتشر نکنید؛ توکن ربات و کلیدها داخل آن است.
+- 🔑 مقدار `ENCRYPTION_KEY` را همراه بکاپ نگه دارید. بدون آن، اطلاعات ورود پنل‌ها قابل خواندن نیست.
+- 🔒 بکاپ‌ها حاوی اطلاعات کاربران‌اند؛ آن‌ها را فقط جای امن نگه دارید.
+- 🔥 اگر توکن ربات لو رفت، از BotFather با `/revoke` توکن جدید بگیرید و در `.env` عوضش کنید.
+
+## ❓ مشکلات رایج
+
+| مشکل | راه‌حل |
+|---|---|
+| ربات جواب نمی‌دهد | `docker compose logs --tail=50 bot` را ببینید و توکن را چک کنید |
+| تاپیک‌های لاگ ساخته نمی‌شوند | Topics گروه روشن باشد، ربات ادمین باشد و Manage Topics داشته باشد |
+| ساب‌لینک اشتباه است | آدرس پایهٔ ساب همان پنل را تنظیم کنید |
+| تغییر `.env` اعمال نشد | `docker compose up -d --build` را بزنید |
+
+</div>
