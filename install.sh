@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1091
-[ -f "$(dirname "$0")/banner.sh" ] && source "$(dirname "$0")/banner.sh" && show_banner
 set -euo pipefail
 REPO_URL="https://github.com/capitan-bot/Ovira_bot.git"
 DIR=/opt/capitan
@@ -14,6 +13,7 @@ command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
 
 if [ -d "$DIR/.git" ]; then git -C "$DIR" pull --ff-only; else git clone "$REPO_URL" "$DIR"; fi
 cd "$DIR"
+[ -f "$DIR/banner.sh" ] && [ -z "${CAPITAN_BANNER_SHOWN:-}" ] && source "$DIR/banner.sh" && show_banner
 mkdir -p storage
 
 ask() { local v; read -rp "$2" v </dev/tty; printf '%s' "$v" | tr -d '\r\n'; }
