@@ -1,93 +1,174 @@
-# CAPITAN VPN — Stage 1: Database & Architecture
 
-## What's in this stage
-- Project skeleton (bot / backend / adapters / admin / database / workers)
-- PostgreSQL schema (SQLAlchemy 2.0 async) + Alembic baseline migration
-- Atomic wallet ledger (row lock + idempotency keys) — `backend/services/wallet.py`
-- Invoices with unique payable amount (DB partial unique index) and
-  once-only receipt approval — `backend/services/invoices.py`
-- Fernet encryption for panel credentials and stored config files — `config/crypto.py`
-- Panel adapter contract (`adapters/base.py`). **Real adapters come in stages 4–5.**
-- Idempotent seed for editable settings (card info, texts, test limits)
-- Tests (wallet, invoices, crypto)
+# 🚀 CAPITAN VPN
 
-## Quick setup
-```bash
-bash setup.sh   # asks for bot token + admin numeric ID, generates all keys, starts DB
+### 🤖 ربات فروش و مدیریت اشتراک VPN در تلگرام
+مخصوص **پنل اویرا (Ovira)** 💎
+
+> 👨‍💻 سازنده ربات: **Amiralihdtt** — [@Amiralihdtt](https://t.me/Amiralihdtt)
+> 🛰 سازنده پنل اویرا: **erfan xray**
+
+---
+
+## ✨ امکانات ربات
+
+### 👤 بخش کاربران
+- 🛒 **خرید اشتراک:** انتخاب پلن و ساخت خودکار سرویس روی پنل
+- 🎁 **تست رایگان:** دریافت اکانت تست با محدودیت حجم و زمان
+- 💳 **کیف پول:** مشاهده موجودی و تاریخچه تراکنش‌ها
+- 💰 **شارژ کارت‌به‌کارت:** فاکتور با مبلغ یکتا، ارسال رسید و تأیید توسط ادمین
+- 📦 **سرویس‌های من:** مشاهده وضعیت، مصرف، تاریخ انقضا و آخرین به‌روزرسانی
+- 📥 دریافت کانفیگ، 📷 کد QR، 🔁 دریافت لینک جدید
+- ⏸ خاموش و روشن کردن سرویس، 🗑 حذف سرویس، 🔄 به‌روزرسانی
+- 🎧 **پشتیبانی:** ارتباط مستقیم با ادمین
+
+### 🛠 پنل مدیریت (ادمین)
+- 📊 آمار ربات
+- 👥 مدیریت کاربران (مسدود و آزاد کردن)
+- 🛰 مدیریت پنل‌ها و پروفایل‌ها
+- 🧾 رسیدهای در انتظار (✅ تأیید / ❌ رد)
+- 📢 پیام همگانی
+- 🎁 تنظیمات تست رایگان
+- ⚙️ تنظیمات ربات (کارت، پشتیبانی، فروشگاه، حداقل و حداکثر شارژ)
+- 🎨 تغییر ظاهر ربات (جزئیات پایین)
+- ⏸ خاموش کردن ربات
+
+### 🔌 پنل‌های پشتیبانی‌شده
+- 💎 اویرا (Ovira)
+- 🔷 سنایی (3x-ui)
+- 🛡 پاسارگارد (PasarGuard)
+- 🌐 مرزبان (Marzban)
+- 🔄 ربکا (Rebecca)
+
+---
+
+## 🎨 تغییرات ظاهری
+
+مسیر: **پنل مدیریت ⬅️ تغییر ظاهر**
+همه‌چیز از لیست انتخاب می‌شه و نیازی به تایپ کردن callback یا متن اصلی نیست.
+
+| قابلیت | توضیح |
+|:---|:---|
+| ✨ ایموجی پریمیوم | جایگزینی ایموجی ساده با ایموجی پریمیوم تلگرام در متن‌ها و آیکون دکمه‌ها |
+| ✏️ تغییر نام دکمه‌ها | عوض کردن عنوان دکمه‌ها بدون تغییر در عملکردشون |
+| 📝 تغییر متن‌های ربات | انتخاب خط متن از لیست بخش‌بندی‌شده و نوشتن متن جدید |
+| 🌈 رنگ دکمه‌ها | انتخاب بخش ⬅️ دکمه ⬅️ رنگ (آبی، سبز، قرمز) |
+| 👋 متن خوش‌آمدگویی | تنظیم پیام `/start` با `{name}` به جای اسم کاربر |
+| ♻️ بازنشانی | پاک کردن همه تنظیمات ظاهری |
+
+### 🌈 نکات رنگ دکمه‌ها
+- 🔵 آبی (primary)، 🟢 سبز (success)، 🔴 قرمز (danger)
+- دکمه‌ها وقتی برای کاربر ارسال شدن ثبت می‌شن. اگه دکمه‌ای تو لیست نبود، اول اون صفحه رو تو ربات باز کن
+- رنگ فقط روی پیام‌های **جدید** اعمال می‌شه
+- نیاز به aiogram نسخه 3.31 یا بالاتر و تلگرام به‌روز
+
+### 📝 نکات تغییر متن
+- پیام‌ها خط‌به‌خط ثبت می‌شن
+- خط‌های دارای عدد (مصرف، تاریخ، آیدی) ثبت نمی‌شن؛ از «ورود دستی متن» استفاده کن
+
+### 👋 نمونه متن خوش‌آمدگویی
+```
+🌟 {name} عزیز، خوش اومدی!
+به CAPITAN VPN خوش آمدید.
 ```
 
-## Manual setup
+---
+
+## ⚡ نصب سریع
+
+```bash
+git clone https://github.com/capitan-bot/Ovira_bot.git capitan
+cd capitan
+bash menu.sh
+```
+
+بعد از نمایش بنر، منو میاد:
+
+| گزینه | کار |
+|:---:|:---|
+| 1️⃣ | 📥 **نصب:** توکن ربات و آیدی عددی ادمین رو می‌پرسه و کلیدها رو می‌سازه |
+| 2️⃣ | 🗑 **حذف:** حذف کانتینرها (دیتابیس و `.env` با تأیید جدا پاک می‌شن) |
+| 3️⃣ | 🔄 **آپدیت:** بکاپ `.env`، دریافت نسخه جدید، migrate و ساخت دوباره ربات |
+
+> ⚠️ **حتماً از `ENCRYPTION_KEY` بکاپ بگیر!** بدون اون، اطلاعات ذخیره‌شده پنل‌ها و فایل‌های کانفیگ قابل خوندن نیست.
+
+### 🔧 نصب دستی
 ```bash
 cp .env.example .env
-# 1) Revoke the old bot token in @BotFather (/revoke) and paste the NEW one in BOT_TOKEN
-# 2) Generate secrets and paste into .env:
+# 1) توکن قدیمی رو در @BotFather با /revoke باطل کن و توکن جدید رو تو BOT_TOKEN بذار
+# 2) ساخت کلیدها:
 python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # ENCRYPTION_KEY
 python -c "import secrets;print(secrets.token_urlsafe(48))"                               # JWT_SECRET
-# 3) Use the same strong password in POSTGRES_PASSWORD and DATABASE_URL
+# 3) یک رمز قوی یکسان برای POSTGRES_PASSWORD و DATABASE_URL بذار
 
 docker compose up -d db
-docker compose run --rm migrate      # alembic upgrade head + seed
+docker compose run --rm migrate
+docker compose up -d --build bot
 ```
-**Back up ENCRYPTION_KEY.** Losing it makes stored panel credentials and config files unreadable.
 
-## Tests (local)
+### 🔄 آپدیت دستی
+```bash
+git pull
+docker compose run --rm migrate
+docker compose up -d --build bot
+docker compose logs -f bot      # خروج با Ctrl+C
+```
+
+---
+
+## 💬 دستورهای ربات
+
+| دستور | دسترسی | کار |
+|:---|:---:|:---|
+| `/start` | 👤 همه | منوی اصلی |
+| `/id` | 👤 همه | نمایش آیدی عددی |
+| `/admin` | 🛠 ادمین | پنل مدیریت |
+| `/settings` | 🛠 ادمین | تنظیمات ربات |
+| `/setcard` | 🛠 ادمین | تنظیم شماره کارت |
+| `/setsupport` | 🛠 ادمین | تنظیم پشتیبانی |
+| `/setshop` | 🛠 ادمین | تنظیم فروشگاه |
+| `/pending` | 🛠 ادمین | رسیدهای در انتظار |
+| `/setcharge MIN MAX` | 🛠 ادمین | حداقل و حداکثر شارژ |
+| `/setextra MIN MAX` | 🛠 ادمین | بازه مبلغ اضافه فاکتور |
+
+---
+
+## 🔐 امنیت و طراحی
+
+- 💵 واحد پول: **تومان** (عدد صحیح). مبلغ اضافه فاکتور هیچ‌وقت به کیف پول اضافه نمی‌شه
+- 🔒 اطلاعات ورود پنل‌ها و فایل‌های کانفیگ با **Fernet** رمزنگاری می‌شن
+- ⚛️ تغییر کیف پول فقط از یک مسیر امن انجام می‌شه و موجودی هیچ‌وقت منفی نمی‌شه
+- ✅ تأیید رسید فقط **یک‌بار** ممکنه (جلوگیری از تأیید دوباره)
+- 🖼 یک عکس رسید دو بار پذیرفته نمی‌شه
+- ⏳ فاکتورهای پرداخت‌نشده هر ۵ دقیقه به‌صورت خودکار منقضی می‌شن
+- 👮 آیدی ادمین‌ها از `ADMIN_TELEGRAM_IDS` خونده می‌شه
+- 🚫 کاربران مسدودشده از ربات خارج می‌شن
+- ⚠️ وضعیت FSM فعلاً در حافظه است و با ری‌استارت، مراحل نیمه‌کاره ریست می‌شه
+
+---
+
+## 🧪 تست
+
 ```bash
 pip install -r requirements.txt
 pytest
 ```
-Tests use in-memory SQLite. Row locks (`FOR UPDATE`) only take effect on PostgreSQL; the
-production guarantees (unique amount, single approval, non-negative balance) are enforced by
-DB constraints and guarded UPDATEs, which work on both.
 
-## Design decisions
-- Money = integer Toman. The random invoice extra is never credited to the wallet or counted in prices.
-- Wallet changes only through `apply_wallet_change` → one ledger row per change, `CHECK balance >= 0`.
-- Receipt approval is one `UPDATE ... WHERE status='pending' RETURNING`, so double-approval is impossible.
-- Rejected receipt → invoice returns to `pending`, user can resend until it expires.
-- Panel pricing/limits live on the `panels` row; texts/card/test rules live in `settings`. Nothing hard-coded.
-- Config files are stored encrypted, byte-for-byte, with the panel's original filename.
-- Admin IDs come from `ADMIN_TELEGRAM_IDS`; the dashboard login (stage 8) is separate.
-
-## Panel status (honest notes)
-- **Sanaei (3x-ui)**: adapter planned for stage 5; I will verify endpoints against the installed version's API.
-- **Panel one (OpenVPN/WireGuard)**: still need the exact panel name/version to read its real API. No adapter is faked.
-
-## Next: Stage 2 — Telegram bot, main menu, user registration, block middleware
-
----
-## Stage 2 — Telegram bot (added)
-- `bot/main.py` — aiogram 3 polling; notifies admins at startup
-- Middlewares: one DB transaction per update; auto-registration + wallet creation; blocked users stopped; admin flag from `ADMIN_TELEGRAM_IDS`
-- Main menu (5 buttons), wallet view (real balance), other sections show an honest "not active yet"
-- Admin commands in Telegram: `/admin`, `/settings`, `/setcard`, `/setsupport`, `/setshop`; any user: `/id`
-- FSM state is in memory for now (a restart resets half-finished flows).
-
-### Update an existing server
-```bash
-cd /root && unzip -o "capitan_stage2.zip"     # .env is NOT overwritten
-cd capitan
-docker compose run --rm migrate
-docker compose up -d --build bot
-docker compose logs -f bot                   # Ctrl+C to leave logs
-```
-
----
-## Stage 3 — Wallet top-up (card to card)
-Flow: wallet → charge → amount → invoice (unique payable amount) → receipt photo → admins get photo +
-✅/❌ → approve credits **only the base amount** (once) / reject asks for a reason, user may resend.
-- Admin commands: `/pending`, `/setcharge MIN MAX`, `/setextra MIN MAX`
-- Unpaid invoices expire automatically (every 5 min), freeing their reserved amounts.
-- The same receipt image can't be submitted twice (Telegram `file_unique_id`).
-- Update: `unzip -o capitan_stage3.zip && cd capitan && docker compose run --rm migrate && docker compose up -d --build bot`
+تست‌ها روی SQLite حافظه‌ای اجرا می‌شن. قفل ردیف‌ها (`FOR UPDATE`) فقط روی PostgreSQL اثر داره.
 
 ---
 
-## ✨ قابلیت‌های جدید اضافه‌شده (بخش «🎨 تغییرات ظاهری» در پنل مدیریت)
+## 📁 ساختار پروژه
 
-تمامی امکانات شخصی‌سازی ظاهر ربات در یک منوی شیشه‌ای واحد به نام **«🎨 تغییرات ظاهری»** در پنل ادمین قرار گرفته‌اند:
+| پوشه | کار |
+|:---|:---|
+| 🤖 `bot/` | ربات تلگرام (هندلرها، منوها، میدلورها) |
+| ⚙️ `backend/` | منطق کسب‌وکار (کیف پول، فاکتور، خرید) |
+| 🔌 `adapters/` | اتصال به پنل‌ها |
+| 🗄 `database/` | مدل‌ها و مایگریشن‌ها |
+| ⏱ `workers/` | کارهای زمان‌بندی‌شده |
+| 🔑 `config/` | تنظیمات و رمزنگاری |
 
-1. **✨ ایموجی پریمیوم:** جایگزینی خودکار هر ایموجی ساده با ایموجی متحرک پریمیوم تلگرام در تمام متون و کپشن‌های ربات.
-2. **🌈 رنگ دکمه‌ها:** انتخاب رنگ اختصاصی برای هر دکمه (بنفش نئون، سبز، قرمز، آبی، طلایی، نارنجی، دارک و نقره‌ای) یا اعمال تم رنگی یکپارچه روی کل منو با یک کلیک.
-3. **✏️ تغییر نام دکمه‌ها:** تغییر عنوان هر دکمه شیشه‌ای یا کیبورد از داخل پنل ادمین بدون تغییر در عملکرد فنی دکمه.
-4. **📐 تغییر جایگاه و چیدمان دکمه‌ها:** جابجایی ترتیب دکمه‌های منوی اصلی و چیدمان ردیف‌ها (تکی، دوتایی، سه‌تایی و...) به صورت پویا.
-5. **📝 تغییر متن‌های ربات:** جایگزینی و ویرایش هر بخش از متن‌های ربات مستقیماً از طریق پنل مدیریت.
+---
+
+<p align="center">
+💎 ساخته‌شده با ❤️ توسط <b>Amiralihdtt</b> — <a href="https://t.me/Amiralihdtt">@Amiralihdtt</a>
