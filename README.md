@@ -76,17 +76,32 @@
 
 ## ⚡ نصب سریع
 
+روی یک سرور **Ubuntu/Debian** با دسترسی **root** فقط همین یک خط رو بزن:
+
 ```bash
-git clone https://github.com/capitan-bot/Ovira_bot.git capitan
-cd capitan
-bash menu.sh
+apt-get update -y && apt-get install -y curl && bash <(curl -fsSL https://raw.githubusercontent.com/capitan-bot/Ovira_bot/main/install.sh)
 ```
 
-بعد از نمایش بنر، منو میاد:
+نصب‌کننده خودش Docker و ابزارها رو نصب می‌کنه، ریپو رو توی `/opt/capitan` می‌ذاره و این‌ها رو می‌پرسه:
+
+| سؤال | توضیح |
+|:---|:---|
+| 🤖 توکن ربات | از @BotFather |
+| 🆔 آیدی عددی ادمین | از ربات @userinfobot (چند ادمین با کاما) |
+| 🏪 نام فروشگاه، 💳 کارت، 👤 صاحب کارت، 🎧 پشتیبانی | اختیاری (Enter = رد) |
+| 📋 آیدی گروه لاگ | اختیاری، عدد مثل `-100123...` |
+
+کلیدهای امنیتی و رمز دیتابیس به‌صورت تصادفی ساخته می‌شن و فقط روی سرور خودت توی `.env` می‌مونن.
+
+### 🧰 منوی مدیریت
+
+```bash
+bash /opt/capitan/menu.sh
+```
 
 | گزینه | کار |
 |:---:|:---|
-| 1️⃣ | 📥 **نصب:** توکن ربات و آیدی عددی ادمین رو می‌پرسه و کلیدها رو می‌سازه |
+| 1️⃣ | 📥 **نصب** |
 | 2️⃣ | 🗑 **حذف:** حذف کانتینرها (دیتابیس و `.env` با تأیید جدا پاک می‌شن) |
 | 3️⃣ | 🔄 **آپدیت:** بکاپ `.env`، دریافت نسخه جدید، migrate و ساخت دوباره ربات |
 
@@ -94,20 +109,26 @@ bash menu.sh
 
 ### 🔧 نصب دستی
 ```bash
+git clone https://github.com/capitan-bot/Ovira_bot.git /opt/capitan
+cd /opt/capitan
 cp .env.example .env
-# 1) توکن قدیمی رو در @BotFather با /revoke باطل کن و توکن جدید رو تو BOT_TOKEN بذار
-# 2) ساخت کلیدها:
-python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # ENCRYPTION_KEY
-python -c "import secrets;print(secrets.token_urlsafe(48))"                               # JWT_SECRET
-# 3) یک رمز قوی یکسان برای POSTGRES_PASSWORD و DATABASE_URL بذار
+# 1) توکن ربات رو از @BotFather بگیر و تو BOT_TOKEN بذار
+# 2) ADMIN_TELEGRAM_IDS: آیدی عددی ادمین (چندتا با کاما)
+# 3) ساخت کلیدها:
+python3 -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # ENCRYPTION_KEY
+python3 -c "import secrets;print(secrets.token_urlsafe(48))"                                # JWT_SECRET
+# 4) POSTGRES_USER=capitan ، POSTGRES_DB=capitan و یک رمز قوی (فقط حرف و عدد) برای POSTGRES_PASSWORD
+#    DATABASE_URL=postgresql+asyncpg://capitan:رمز@db:5432/capitan
+# 5) LOG_GROUP_ID باید عدد باشه (اگه گروه لاگ نداری 0 بذار)
 
-docker compose up -d db
-docker compose run --rm migrate
-docker compose up -d --build bot
+mkdir -p storage
+docker compose up -d --build
+docker compose logs -f bot      # خروج با Ctrl+C
 ```
 
 ### 🔄 آپدیت دستی
 ```bash
+cd /opt/capitan
 git pull
 docker compose run --rm migrate
 docker compose up -d --build bot
