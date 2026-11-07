@@ -1,552 +1,501 @@
-import json
+import html
+import sqlite3
+from pathlib import Path
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-
-from bot.filters import AdminOnly, not_command
-from bot.keyboards.admin import kb
+from aiogram.fsm.state import StatesGroup, State
 from bot.ui_manager import (
-    COLOR_PRESETS,
-    init_custom_db,
     set_premium_emoji, delete_premium_emoji, get_all_emojis,
     set_text_replacement, delete_text_replacement, get_text_replacements,
     set_button_rename, delete_button_rename, get_button_renames,
-    set_button_color, delete_button_color, clear_all_button_colors, get_button_colors,
+    set_button_color, delete_button_color, get_button_colors,
+    get_seen_buttons, get_seen_button, section_of, SECTIONS,
+    get_seen_lines, get_seen_line,
     get_ui_config, set_ui_config,
 )
 
+
 router = Router()
-router.message.filter(AdminOnly())
-router.callback_query.filter(AdminOnly())
 
-init_custom_db()
+class CustomUIStates(StatesGroup):
+    waiting_for_base_emoji = State()
+    waiting_for_premium_emoji = State()
+    waiting_for_color_target = State()
+    waiting_for_color_style = State()
+    waiting_for_rename_old = State()
+    waiting_for_rename_new = State()
+    waiting_for_text_old = State()
+    waiting_for_text_new = State()
+    waiting_for_welcome = State()
 
-class CustomAdminStates(StatesGroup):
-    emj_base = State()
-    emj_premium = State()
-    emj_delete = State()
-    btn_old_name = State()
-    btn_new_name = State()
-    btn_del_name = State()
-    btn_layout_order = State()
-    txt_old = State()
-    txt_new = State()
-    txt_del_id = State()
-    clr_custom_btn = State()
+def main_custom_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✨ ایموجی پریمیوم", callback_data="admin:custom_emojis"),
+            InlineKeyboardButton(text="✏️ تغییر نام دکمه‌ها", callback_data="admin:custom_renames")
+        ],
+        [
+            InlineKeyboardButton(text="📝 تغییر متن‌های ربات", callback_data="admin:custom_texts")
+        ],
+        [
+            InlineKeyboardButton(text="🎨 رنگ دکمه‌ها", callback_data="admin:colors"),
+            InlineKeyboardButton(text="👋 متن خوش‌آمدگویی", callback_data="admin:welcome")
+        ],
+        [
+            InlineKeyboardButton(text="♻️ بازنشانی کل ظاهر", callback_data="admin:custom_reset")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 بازگشت به پنل مدیریت", callback_data="adm:home")
+        ]
+    ])
 
-# ----------------- منوی اصلی «🎨 تغییرات ظاهری» -----------------
-def appearance_main_kb():
-    return kb(
-        [("✨ ایموجی پریمیوم", "adm:emj"), ("🌈 رنگ دکمه‌ها", "adm:clr")],
-        [("✏️ تغییر نام دکمه‌ها", "adm:ui:btn_rename"), ("📐 تغییر جایگاه دکمه‌ها", "adm:ui:btn_layout")],
-        [("📝 تغییر متن‌های ربات", "adm:ui:texts")],
-        [("📋 مشاهده تغییرات فعال", "adm:ui:list"), ("♻️ بازنشانی کل ظاهر", "adm:ui:reset")],
-        [("🔙 بازگشت به پنل مدیریت", "adm:home")],
-    )
-
-@router.callback_query(F.data == "adm:ui")
-async def open_appearance_menu(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.in_({"adm:ui", "admin:custom"}))
+async def admin_custom_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     emojis = get_all_emojis()
     renames = get_button_renames()
-    texts = get_text_replacements()
+    replacements = get_text_replacements()
     colors = get_button_colors()
-    has_layout = "سفارشی ✅" if get_ui_config("custom_main_layout") else "پیش‌فرض"
-
-    msg = (
-        "🎨 <b>مدیریت تغییرات ظاهری ربات</b>\n\n"
-        f"✨ ایموجی‌های پریمیوم فعال: <b>{len(emojis)}</b>\n"
-        f"🌈 دکمه‌های رنگ‌شده: <b>{len(colors)}</b>\n"
-        f"✏️ دکمه‌های تغییر نام یافته: <b>{len(renames)}</b>\n"
-        f"📐 چیدمان دکمه‌های منو: <b>{has_layout}</b>\n"
-        f"📝 متن‌های ویرایش‌شده: <b>{len(texts)}</b>\n\n"
+    
+    text = (
+        "🛠 <b>مدیریت تغییرات ظاهری ربات</b>\n\n"
+        f"✨ ایموجی‌های پریمیوم فعال: {len(emojis)}\n"
+        f"✏️ تغییر نام دکمه‌ها: {len(renames)}\n"
+        f"📝 متن‌های ویرایش‌شده: {len(replacements)}\n"
+        f"🎨 دکمه‌های رنگ‌شده: {len(colors)}\n\n"
         "از طریق دکمه‌های زیر می‌توانید تمام بخش‌های ظاهری ربات را به دلخواه شخصی‌سازی کنید:"
     )
-    await call.message.edit_text(msg, reply_markup=appearance_main_kb(), parse_mode="HTML")
-    await call.answer()
+    
+    await callback.message.edit_text(text, reply_markup=main_custom_kb(), parse_mode="HTML")
+    await callback.answer()
 
-# ----------------- زیرمنوی ۱: ایموجی پریمیوم -----------------
-def emoji_menu_kb():
-    return kb(
-        [("➕ افزودن / جایگزینی ایموجی", "adm:emj:add")],
-        [("🗑 حذف ایموجی", "adm:emj:del"), ("📋 لیست ایموجی‌ها", "adm:emj:list")],
-        [("🔙 بازگشت به تغییرات ظاهری", "adm:ui")],
-    )
+@router.callback_query(F.data == "admin:back_panel")
+async def back_to_admin_panel(callback: CallbackQuery, session, state: FSMContext):
+    await state.clear()
+    await cmd_admin(callback.message, session, state)
+    await callback.answer()
 
-@router.callback_query(F.data == "adm:emj")
-async def open_emoji_menu(call: CallbackQuery, state: FSMContext):
+# ==================== ۱. ایموجی پریمیوم ====================
+@router.callback_query(F.data == "admin:custom_emojis")
+async def custom_emojis_list(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     emojis = get_all_emojis()
-    text = (
-        "✨ <b>مدیریت ایموجی‌های پریمیوم ربات</b>\n\n"
-        f"📊 تعداد ایموجی‌های فعال: <b>{len(emojis)}</b>\n\n"
-        "ابتدا ایموجی ساده (پایه) و سپس ایموجی پریمیوم را بفرستید تا در کل ربات جایگزین شود:"
-    )
-    await call.message.edit_text(text, reply_markup=emoji_menu_kb(), parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "adm:emj:add")
-async def start_add_emoji(call: CallbackQuery, state: FSMContext):
-    await state.set_state(CustomAdminStates.emj_base)
-    await call.message.edit_text(
-        "1️⃣ لطفاً ابتدا <b>ایموجی ساده (پایه)</b> را بفرستید (مثلاً ❤️ یا 🔥):",
-        reply_markup=kb([("🔙 انصراف", "adm:emj")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.message(CustomAdminStates.emj_base, F.text, not_command)
-async def receive_base_emoji(message: Message, state: FSMContext):
-    base = message.text.strip()
-    if not base or len(base) > 8:
-        await message.answer("❌ لطفاً فقط یک ایموجی ساده ارسال کنید:", reply_markup=kb([("🔙 انصراف", "adm:emj")]))
-        return
-    await state.update_data(base_emoji=base)
-    await state.set_state(CustomAdminStates.emj_premium)
-    await message.answer(
-        f"✅ ایموجی پایه ( {base} ) دریافت شد.\n\n"
-        "2️⃣ حالا <b>ایموجی پریمیوم</b> مورد نظر را ارسال کنید تا جایگزین آن شود:",
-        reply_markup=kb([("🔙 انصراف", "adm:emj")]),
-        parse_mode="HTML",
-    )
-
-@router.message(CustomAdminStates.emj_premium, not_command)
-async def receive_premium_emoji(message: Message, state: FSMContext):
-    entities = message.entities or message.caption_entities or []
-    custom_id = None
-    for ent in entities:
-        if ent.type == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
-            custom_id = ent.custom_emoji_id
-            break
-
-    if not custom_id:
-        await message.answer(
-            "❌ این پیام حاوی ایموجی پریمیوم نیست! لطفاً یک ایموجی پریمیوم تلگرام ارسال کنید:",
-            reply_markup=kb([("🔙 انصراف", "adm:emj")]),
-        )
-        return
-
-    data = await state.get_data()
-    base = data["base_emoji"]
-    set_premium_emoji(base, custom_id)
-    await state.clear()
-
-    await message.answer(
-        f"🎉 <b>ایموجی پریمیوم با موفقیت ست شد!</b>\n\n"
-        f"🔹 ایموجی ساده: {base}\n"
-        f"🔸 نسخه پریمیوم: <tg-emoji emoji-id=\"{custom_id}\">{base}</tg-emoji>",
-        reply_markup=emoji_menu_kb(),
-        parse_mode="HTML",
-    )
-
-@router.callback_query(F.data == "adm:emj:list")
-async def list_emojis(call: CallbackQuery):
-    emojis = get_all_emojis()
+    text = "✨ <b>مدیریت ایموجی‌های پریمیوم</b>\n\nلیست ایموجی‌های جایگزین‌شده:\n"
     if not emojis:
-        await call.answer("⚠️ هنوز هیچ ایموجی پریمیومی ثبت نشده است.", show_alert=True)
-        return
-    lines = ["📋 <b>لیست ایموجی‌های پریمیوم فعال:</b>\n"]
-    for base, cid in emojis.items():
-        lines.append(f"• {base} ➔ <tg-emoji emoji-id=\"{cid}\">{base}</tg-emoji> (<code>{cid}</code>)")
-    await call.message.edit_text("\n".join(lines), reply_markup=emoji_menu_kb(), parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "adm:emj:del")
-async def start_delete_emoji(call: CallbackQuery, state: FSMContext):
-    if not get_all_emojis():
-        await call.answer("⚠️ لیستی برای حذف وجود ندارد.", show_alert=True)
-        return
-    await state.set_state(CustomAdminStates.emj_delete)
-    await call.message.edit_text(
-        "🗑 لطفاً <b>ایموجی ساده (پایه)</b> که می‌خواهید حذف شود را بفرستید:",
-        reply_markup=kb([("🔙 انصراف", "adm:emj")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.message(CustomAdminStates.emj_delete, F.text, not_command)
-async def confirm_delete_emoji(message: Message, state: FSMContext):
-    delete_premium_emoji(message.text.strip())
-    await state.clear()
-    await message.answer("✅ ایموجی به حالت ساده برگشت.", reply_markup=emoji_menu_kb())
-
-
-# ----------------- زیرمنوی ۲: رنگ دکمه‌ها -----------------
-def color_menu_kb():
-    return kb(
-        [("🎨 انتخاب دکمه و تغییر رنگ", "adm:clr:pick")],
-        [("🟣 تم یکدست بنفش نئون", "adm:clr:theme:purple"), ("🟢 تم یکدست سبز نئون", "adm:clr:theme:green")],
-        [("🌈 تم رنگارنگ ویژه (VIP)", "adm:clr:theme:rainbow")],
-        [("📋 لیست دکمه‌های رنگی", "adm:clr:list"), ("♻️ حذف همه رنگ‌ها", "adm:clr:reset")],
-        [("🔙 بازگشت به تغییرات ظاهری", "adm:ui")],
-    )
-
-def color_palette_kb(back_cb: str = "adm:clr:pick"):
-    return kb(
-        [("🟣 بنفش نئون", "adm:clr:set:purple"), ("🟢 سبز نئون", "adm:clr:set:green")],
-        [("🔴 قرمز ویژه", "adm:clr:set:red"), ("🔵 آبی الماسی", "adm:clr:set:blue")],
-        [("🟡 طلایی VIP", "adm:clr:set:gold"), ("🟠 نارنجی", "adm:clr:set:orange")],
-        [("⚫️ مشکی دارک", "adm:clr:set:dark"), ("⚪️ سفید نقره‌ای", "adm:clr:set:white")],
-        [("🗑 حذف رنگ این دکمه", "adm:clr:set:none")],
-        [("🔙 بازگشت", back_cb)],
-    )
-
-@router.callback_query(F.data == "adm:clr")
-async def open_color_menu(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    colors = get_button_colors()
-    text = (
-        "🌈 <b>مدیریت رنگ دکمه‌های ربات</b>\n\n"
-        f"🎨 دکمه‌های دارای رنگ اختصاصی: <b>{len(colors)}</b>\n\n"
-        "می‌توانید برای تک‌تک دکمه‌های ربات رنگ دلخواه انتخاب کنید یا با یک کلیک به کل منوی اصلی تم رنگی بدهید:"
-    )
-    await call.message.edit_text(text, reply_markup=color_menu_kb(), parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "adm:clr:pick")
-async def pick_button_for_color(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    detected_raw = get_ui_config("detected_main_buttons")
-    rows = []
-    if detected_raw:
-        try:
-            btns = json.loads(detected_raw)
-            colors = get_button_colors()
-            for i, b in enumerate(btns):
-                c_code = colors.get(b["text"]) or colors.get(b["cb"])
-                badge = COLOR_PRESETS[c_code]["badge"] + " " if c_code in COLOR_PRESETS else ""
-                rows.append([(f"{badge}{b['text']}", f"adm:clr:btn:{i}")])
-        except Exception:
-            pass
-    rows.append([("✍️ تایپ نام یک دکمه دلخواه دیگر", "adm:clr:custom")])
-    rows.append([("🔙 بازگشت به منوی رنگ‌ها", "adm:clr")])
-
-    await call.message.edit_text(
-        "🎨 <b>انتخاب دکمه برای تغییر رنگ</b>\n\n"
-        "یکی از دکمه‌های منوی اصلی زیر را انتخاب کنید (یا گزینه تایپ نام دکمه دلخواه را بزنید):",
-        reply_markup=kb(*rows),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("adm:clr:btn:"))
-async def select_detected_btn_color(call: CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":")[-1])
-    detected_raw = get_ui_config("detected_main_buttons")
-    btns = json.loads(detected_raw) if detected_raw else []
-    if idx < 0 or idx >= len(btns):
-        await call.answer("❌ دکمه یافت نشد.", show_alert=True)
-        return
-    target_btn = btns[idx]["text"]
-    await state.update_data(clr_target=target_btn)
-    await call.message.edit_text(
-        f"🎨 دکمه انتخاب‌شده: <b>{target_btn}</b>\n\n"
-        "حالا رنگ مورد نظر خود را برای این دکمه انتخاب کنید:",
-        reply_markup=color_palette_kb("adm:clr:pick"),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "adm:clr:custom")
-async def ask_custom_btn_color(call: CallbackQuery, state: FSMContext):
-    await state.set_state(CustomAdminStates.clr_custom_btn)
-    await call.message.edit_text(
-        "✍️ لطفاً <b>نام دقیق دکمه</b> مورد نظر را ارسال کنید تا رنگش را انتخاب کنیم:",
-        reply_markup=kb([("🔙 انصراف", "adm:clr:pick")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.message(CustomAdminStates.clr_custom_btn, F.text, not_command)
-async def receive_custom_btn_for_color(message: Message, state: FSMContext):
-    target_btn = message.text.strip()
-    await state.update_data(clr_target=target_btn)
-    await state.set_state(None)
-    await message.answer(
-        f"🎨 دکمه انتخاب‌شده: <b>{target_btn}</b>\n\n"
-        "حالا رنگ مورد نظر خود را برای این دکمه انتخاب کنید:",
-        reply_markup=color_palette_kb("adm:clr:pick"),
-        parse_mode="HTML",
-    )
-
-@router.callback_query(F.data.startswith("adm:clr:set:"))
-async def apply_selected_color(call: CallbackQuery, state: FSMContext):
-    color_code = call.data.split(":")[-1]
-    data = await state.get_data()
-    target_btn = data.get("clr_target")
-    if not target_btn:
-        await call.answer("⚠️ ابتدا یک دکمه را انتخاب کنید.", show_alert=True)
-        return
-
-    if color_code == "none":
-        delete_button_color(target_btn)
-        await call.answer("✅ رنگ دکمه حذف شد.", show_alert=True)
+        text += "هیچ ایموجی سفارشی ثبت نشده است.\n"
     else:
-        set_button_color(target_btn, color_code)
-        title = COLOR_PRESETS[color_code]["title"]
-        await call.answer(f"✅ رنگ {title} روی دکمه اعمال شد!", show_alert=True)
+        for k, v in emojis.items():
+            text += f"• پایه: {k} ➔ شناسه: <code>{v}</code>\n"
+            
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ افزودن / ویرایش ایموجی", callback_data="admin:emoji_add")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm:ui")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
 
-    await pick_button_for_color(call, state)
+@router.callback_query(F.data == "admin:emoji_add")
+async def emoji_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CustomUIStates.waiting_for_base_emoji)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="admin:custom_emojis")]
+    ])
+    await callback.message.edit_text(
+        "1️⃣ لطفاً ابتدا ایموجی ساده (پایه) را بفرستید (مثلاً ❤️ یا 🔥):",
+        reply_markup=keyboard
+    )
+    await callback.answer()
 
-@router.callback_query(F.data.startswith("adm:clr:theme:"))
-async def apply_full_theme(call: CallbackQuery, state: FSMContext):
-    theme = call.data.split(":")[-1]
-    detected_raw = get_ui_config("detected_main_buttons")
-    if not detected_raw:
-        await call.answer("⚠️ ابتدا یک بار دکمه «🏠 منوی کاربری» را بزنید تا دکمه‌های منو شناسایی شوند.", show_alert=True)
+@router.message(CustomUIStates.waiting_for_base_emoji)
+async def emoji_receive_base(message: Message, state: FSMContext):
+    base_text = (message.text or message.caption or "").strip()
+    if not base_text:
+        await message.answer("❌ لطفاً یک ایموجی معتبر ارسال کنید.")
         return
-    btns = json.loads(detected_raw)
-    rainbow_cycle = ["purple", "green", "blue", "gold", "red", "orange"]
-    for i, b in enumerate(btns):
-        c = rainbow_cycle[i % len(rainbow_cycle)] if theme == "rainbow" else theme
-        set_button_color(b["text"], c)
+    
+    await state.update_data(base_emoji=base_text)
+    await state.set_state(CustomUIStates.waiting_for_premium_emoji)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="admin:custom_emojis")]
+    ])
+    await message.answer(
+        f"✅ ایموجی پایه ( {base_text} ) دریافت شد.\n\n"
+        "2️⃣ حالا ایموجی پریمیوم مورد نظر را ارسال کنید تا جایگزین آن شود:",
+        reply_markup=keyboard
+    )
 
-    await call.answer("🎉 تم رنگی با موفقیت روی تمام دکمه‌های منوی اصلی اعمال شد!", show_alert=True)
-    await open_color_menu(call, state)
+@router.message(CustomUIStates.waiting_for_premium_emoji)
+async def emoji_receive_premium(message: Message, state: FSMContext):
+    custom_emoji_id = None
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "custom_emoji":
+                custom_emoji_id = str(entity.custom_emoji_id)
+                break
+    
+    if not custom_emoji_id and message.text and message.text.strip().isdigit():
+        custom_emoji_id = message.text.strip()
 
-@router.callback_query(F.data == "adm:clr:list")
-async def list_button_colors(call: CallbackQuery):
+    data = await state.get_data()
+    base_emoji = data.get("base_emoji")
+    
+    if custom_emoji_id and base_emoji:
+        set_premium_emoji(base_emoji, custom_emoji_id)
+        await state.clear()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت به لیست ایموجی‌ها", callback_data="admin:custom_emojis")]
+        ])
+        await message.answer(
+            f"✅ ایموجی پریمیوم با موفقیت برای ( {base_emoji} ) ثبت شد!\nشناسه: <code>{custom_emoji_id}</code>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    else:
+        await message.answer("❌ ایموجی ارسالی پریمیوم نبود! لطفاً یک ایموجی پریمیوم تلگرام (یا شناسه عددی آن) را بفرستید.")
+
+# ==================== ۲. رنگ دکمه‌ها ====================
+@router.callback_query(F.data == "admin:colors")
+async def custom_colors_list(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     colors = get_button_colors()
+    text = "🎨 <b>مدیریت رنگ دکمه‌ها</b>\n\nلیست رنگ‌های تنظیم‌شده:\n"
     if not colors:
-        await call.answer("⚠️ هنوز هیچ رنگی برای دکمه‌ها تنظیم نشده است.", show_alert=True)
-        return
-    lines = ["📋 <b>لیست دکمه‌های رنگی فعال:</b>\n"]
-    for k, c in colors.items():
-        title = COLOR_PRESETS.get(c, {}).get("title", c)
-        lines.append(f"• <b>{k}</b> ➔ {title}")
-    await call.message.edit_text("\n".join(lines), reply_markup=color_menu_kb(), parse_mode="HTML")
-    await call.answer()
+        text += "هیچ رنگی ثبت نشده است.\n"
+    else:
+        for k, v in colors.items():
+            text += f"• دکمه: <code>{k}</code> ➔ رنگ: <b>{v}</b>\n"
+            
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ افزودن / تغییر رنگ دکمه", callback_data="admin:color_add")],
+        [InlineKeyboardButton(text="🗑 حذف همه رنگ‌ها", callback_data="admin:color_clear")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm:ui")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
 
-@router.callback_query(F.data == "adm:clr:reset")
-async def reset_button_colors(call: CallbackQuery, state: FSMContext):
-    clear_all_button_colors()
-    await call.answer("✅ رنگ تمامی دکمه‌ها به حالت پیش‌فرض برگشت.", show_alert=True)
-    await open_color_menu(call, state)
+STYLE_ICON = {"primary": "🔵", "success": "🟢", "danger": "🔴"}
+STYLE_NAME = {"primary": "آبی", "success": "سبز", "danger": "قرمز"}
 
+def _kb(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ----------------- زیرمنوی ۳: تغییر نام، جایگاه دکمه‌ها و متن‌ها -----------------
-@router.callback_query(F.data == "adm:ui:btn_rename")
-async def start_btn_rename(call: CallbackQuery, state: FSMContext):
-    await state.set_state(CustomAdminStates.btn_old_name)
-    detected_raw = get_ui_config("detected_main_buttons")
-    hint = ""
-    if detected_raw:
-        try:
-            btns = json.loads(detected_raw)
-            hint = "\n\n💡 <b>دکمه‌های منوی اصلی فعلی (برای کپی راحت):</b>\n" + "\n".join(f"• <code>{b['text']}</code>" for b in btns)
-        except Exception:
-            pass
-    await call.message.edit_text(
-        "✏️ <b>تغییر نام دکمه</b>\n\n"
-        "1️⃣ لطفاً <b>نام فعلی دکمه</b> را ارسال کنید:" + hint,
-        reply_markup=kb([("🗑 حذف یک تغییر نام", "adm:ui:btn_del")], [("🔙 بازگشت به تغییرات ظاهری", "adm:ui")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
+def _btn(text, cb):
+    return InlineKeyboardButton(text=text, callback_data=cb)
 
-@router.message(CustomAdminStates.btn_old_name, F.text, not_command)
-async def receive_btn_old_name(message: Message, state: FSMContext):
-    await state.update_data(old_label=message.text.strip())
-    await state.set_state(CustomAdminStates.btn_new_name)
-    await message.answer(
-        f"✅ دکمه «{message.text.strip()}» انتخاب شد.\n\n"
-        "2️⃣ حالا <b>نام جدید دکمه</b> را ارسال کنید:",
-        reply_markup=kb([("🔙 انصراف", "adm:ui")]),
-    )
-
-@router.message(CustomAdminStates.btn_new_name, F.text, not_command)
-async def receive_btn_new_name(message: Message, state: FSMContext):
-    data = await state.get_data()
-    old_label = data["old_label"]
-    new_label = message.text.strip()
-    set_button_rename(old_label, new_label)
+@router.callback_query(F.data == "admin:color_add")
+async def color_add_start(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await message.answer(
-        f"🎉 نام دکمه با موفقیت تغییر کرد!\n\n"
-        f"قبلی: {old_label}\nجدید: {new_label}",
-        reply_markup=appearance_main_kb(),
-    )
+    counts = {}
+    for _id, key, _label in get_seen_buttons():
+        sec = section_of(key)
+        counts[sec] = counts.get(sec, 0) + 1
+    rows = [[_btn(f"{title} ({counts[sec]})", f"admin:colsec:{sec}")]
+            for sec, title, _ in SECTIONS if counts.get(sec)]
+    has = len(rows) > 0
+    rows.append([_btn("🔙 بازگشت", "admin:colors")])
+    text = ("1️⃣ <b>بخش</b> مورد نظر را انتخاب کنید:" if has else
+            "هنوز دکمه‌ای ثبت نشده. یک‌بار /start را در ربات بزنید و بعد دوباره بیایید.")
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
 
-@router.callback_query(F.data == "adm:ui:btn_del")
-async def start_btn_del(call: CallbackQuery, state: FSMContext):
-    renames = get_button_renames()
-    if not renames:
-        await call.answer("⚠️ هیچ تغییر نامی ثبت نشده است.", show_alert=True)
-        return
-    await state.set_state(CustomAdminStates.btn_del_name)
-    lines = ["🗑 نام اصلی دکمه‌ای که می‌خواهید به حالت قبل برگردد را بفرستید:\n"]
-    for k, v in renames.items():
-        lines.append(f"• <code>{k}</code> (فعلی: {v})")
-    await call.message.edit_text("\n".join(lines), reply_markup=kb([("🔙 بازگشت", "adm:ui")]), parse_mode="HTML")
-    await call.answer()
-
-@router.message(CustomAdminStates.btn_del_name, F.text, not_command)
-async def confirm_btn_del(message: Message, state: FSMContext):
-    delete_button_rename(message.text.strip())
-    await state.clear()
-    await message.answer("✅ نام دکمه به حالت اولیه بازگشت.", reply_markup=appearance_main_kb())
-
-@router.callback_query(F.data == "adm:ui:btn_layout")
-async def start_btn_layout(call: CallbackQuery, state: FSMContext):
-    detected_raw = get_ui_config("detected_main_buttons")
-    if not detected_raw:
-        await call.answer("⚠️ ابتدا یک بار دکمه «🏠 منوی کاربری» یا /start را بزنید تا دکمه‌های منو شناسایی شوند.", show_alert=True)
-        return
-    btns = json.loads(detected_raw)
-    await state.set_state(CustomAdminStates.btn_layout_order)
-    await state.update_data(detected_btns=btns)
-
-    list_str = "\n".join(f"<b>{i+1}.</b> {b['text']}" for i, b in enumerate(btns))
-    help_text = (
-        "📐 <b>تغییر جایگاه و چیدمان دکمه‌های منوی اصلی</b>\n\n"
-        "لیست دکمه‌های منوی اصلی با شماره آن‌ها:\n"
-        f"{list_str}\n\n"
-        "💡 <b>نحوه چیدمان:</b>\n"
-        "شماره دکمه‌هایی که می‌خواهید در یک ردیف باشند را با <code>,</code> جدا کنید و هر ردیف جدید را در یک خط جدید بنویسید.\n\n"
-        "مثال:\n"
-        "<code>1\n2,3\n4,5\n6</code>"
-    )
-    await call.message.edit_text(
-        help_text,
-        reply_markup=kb([("♻️ بازگشت چیدمان به پیش‌فرض", "adm:ui:layout_reset")], [("🔙 انصراف", "adm:ui")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "adm:ui:layout_reset")
-async def reset_btn_layout(call: CallbackQuery, state: FSMContext):
-    set_ui_config("custom_main_layout", "")
-    await state.clear()
-    await call.message.edit_text("✅ چیدمان دکمه‌های منوی اصلی به حالت پیش‌فرض برگشت.", reply_markup=appearance_main_kb())
-    await call.answer()
-
-@router.message(CustomAdminStates.btn_layout_order, F.text, not_command)
-async def receive_btn_layout_order(message: Message, state: FSMContext):
-    data = await state.get_data()
-    btns = data.get("detected_btns", [])
-    raw = message.text.strip().replace("-", "
-")
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-
-    new_grid = []
-    used = set()
-    try:
-        for line in lines:
-            row_cbs = []
-            for part in line.split(","):
-                idx = int(part.strip()) - 1
-                if idx < 0 or idx >= len(btns):
-                    raise ValueError("Out of range")
-                cb = btns[idx]["cb"]
-                if cb not in used:
-                    row_cbs.append(cb)
-                    used.add(cb)
-            if row_cbs:
-                new_grid.append(row_cbs)
-        for b in btns:
-            if b["cb"] not in used:
-                new_grid.append([b["cb"]])
-    except Exception:
-        await message.answer("❌ فرمت واردشده صحیح نیست. فقط از شماره‌های لیست و کاما (,) استفاده کنید:")
-        return
-
-    set_ui_config("custom_main_layout", json.dumps(new_grid))
-    await state.clear()
-    await message.answer("🎉 <b>چیدمان و جایگاه دکمه‌های منوی اصلی با موفقیت بروزرسانی شد!</b>", reply_markup=appearance_main_kb(), parse_mode="HTML")
-
-@router.callback_query(F.data == "adm:ui:texts")
-async def start_text_replace(call: CallbackQuery, state: FSMContext):
-    await state.set_state(CustomAdminStates.txt_old)
-    await call.message.edit_text(
-        "📝 <b>تغییر متن‌های ربات</b>\n\n"
-        "1️⃣ لطفاً <b>متن فعلی</b> (یا بخشی از جمله فعلی ربات که می‌خواهید عوض شود) را دقیقاً ارسال کنید:",
-        reply_markup=kb([("🗑 حذف یک متن جایگزین", "adm:ui:txt_del")], [("🔙 بازگشت به تغییرات ظاهری", "adm:ui")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-@router.message(CustomAdminStates.txt_old, F.text, not_command)
-async def receive_old_text(message: Message, state: FSMContext):
-    await state.update_data(old_text=message.text.strip())
-    await state.set_state(CustomAdminStates.txt_new)
-    await message.answer(
-        "✅ متن فعلی دریافت شد.\n\n"
-        "2️⃣ حالا <b>متن جدید</b> را ارسال کنید تا در تمام پیام‌های ربات جایگزین آن شود:",
-        reply_markup=kb([("🔙 انصراف", "adm:ui")]),
-    )
-
-@router.message(CustomAdminStates.txt_new, F.text, not_command)
-async def receive_new_text(message: Message, state: FSMContext):
-    data = await state.get_data()
-    set_text_replacement(data["old_text"], message.text.strip())
-    await state.clear()
-    await message.answer("🎉 <b>متن جدید با موفقیت ثبت و جایگزین شد!</b>", reply_markup=appearance_main_kb(), parse_mode="HTML")
-
-@router.callback_query(F.data == "adm:ui:txt_del")
-async def start_txt_del(call: CallbackQuery, state: FSMContext):
-    rows = get_text_replacements()
-    if not rows:
-        await call.answer("⚠️ هیچ تغییر متنی ثبت نشده است.", show_alert=True)
-        return
-    await state.set_state(CustomAdminStates.txt_del_id)
-    lines = ["🗑 <b>شماره (کد) متنی که می‌خواهید حذف شود را بفرستید:</b>\n"]
-    for rid, old_t, new_t in rows:
-        lines.append(f"🆔 <code>{rid}</code> : «{old_t[:25]}...» ➔ «{new_t[:25]}...»")
-    await call.message.edit_text("\n".join(lines), reply_markup=kb([("🔙 بازگشت", "adm:ui")]), parse_mode="HTML")
-    await call.answer()
-
-@router.message(CustomAdminStates.txt_del_id, F.text, not_command)
-async def confirm_txt_del(message: Message, state: FSMContext):
-    if not message.text.strip().isdigit():
-        await message.answer("❌ لطفاً فقط عدد کد را ارسال کنید:")
-        return
-    delete_text_replacement(int(message.text.strip()))
-    await state.clear()
-    await message.answer("✅ تغییر متن مورد نظر حذف شد.", reply_markup=appearance_main_kb())
-
-@router.callback_query(F.data == "adm:ui:list")
-async def list_ui_changes(call: CallbackQuery):
-    emojis = get_all_emojis()
-    renames = get_button_renames()
-    texts = get_text_replacements()
+@router.callback_query(F.data.regexp(r"^admin:colsec:\w+$"))
+async def color_section(callback: CallbackQuery, state: FSMContext):
+    sec = callback.data.split(":")[2]
+    title = next((t for s_, t, _ in SECTIONS if s_ == sec), sec)
     colors = get_button_colors()
-    lines = ["📋 <b>لیست کل تغییرات ظاهری فعال:</b>\n"]
-    if emojis:
-        lines.append("✨ <b>ایموجی‌های پریمیوم:</b>")
-        for base, cid in emojis.items():
-            lines.append(f"• {base} ➔ <tg-emoji emoji-id=\"{cid}\">{base}</tg-emoji>")
-        lines.append("")
-    if renames:
-        lines.append("✏️ <b>تغییر نام دکمه‌ها:</b>")
-        for k, v in renames.items():
-            lines.append(f"• {k} ➔ {v}")
-        lines.append("")
-    if colors:
-        lines.append("🌈 <b>رنگ دکمه‌ها:</b>")
-        for k, c in colors.items():
-            lines.append(f"• {k} ➔ {COLOR_PRESETS.get(c, {}).get('title', c)}")
-        lines.append("")
-    if texts:
-        lines.append("📝 <b>تغییر متن‌ها:</b>")
-        for rid, o, n in texts:
-            lines.append(f"• [{rid}] {o[:20]} ➔ {n[:20]}")
-    if not emojis and not renames and not texts and not colors and not get_ui_config("custom_main_layout"):
-        await call.answer("⚠️ هیچ تغییری ثبت نشده است.", show_alert=True)
-        return
-    await call.message.edit_text("\n".join(lines), reply_markup=appearance_main_kb(), parse_mode="HTML")
-    await call.answer()
+    rows = []
+    for bid, key, label in get_seen_buttons():
+        if section_of(key) == sec:
+            mark = STYLE_ICON.get(colors.get(key), "⚪️")
+            rows.append([_btn(f"{mark} {label}", f"admin:colbtn:{bid}")])
+    rows.append([_btn("🔙 بازگشت به بخش‌ها", "admin:color_add")])
+    await callback.message.edit_text(f"{title}\n\n2️⃣ دکمه را انتخاب کنید:", reply_markup=_kb(rows))
+    await callback.answer()
 
-@router.callback_query(F.data == "adm:ui:reset")
-async def reset_all_ui(call: CallbackQuery):
-    for k in list(get_button_renames().keys()):
-        delete_button_rename(k)
-    for rid, _, _ in get_text_replacements():
-        delete_text_replacement(rid)
-    clear_all_button_colors()
-    set_ui_config("custom_main_layout", "")
-    await call.answer("✅ تمام دکمه‌ها، رنگ‌ها و متن‌ها به حالت پیش‌فرض بازگشتند.", show_alert=True)
-    await call.message.edit_text(
-        "✅ تمام تنظیمات ظاهری، رنگ‌ها، نام دکمه‌ها و متن‌ها به حالت پیش‌فرض برگشت.",
-        reply_markup=appearance_main_kb()
-    )
+@router.callback_query(F.data.regexp(r"^admin:colbtn:\d+$"))
+async def color_pick_button(callback: CallbackQuery, state: FSMContext):
+    bid = int(callback.data.split(":")[2])
+    row = get_seen_button(bid)
+    if not row:
+        await callback.answer("دکمه پیدا نشد", show_alert=True)
+        return
+    _id, key, label = row
+    cur = STYLE_NAME.get(get_button_colors().get(key), "پیش‌فرض")
+    rows = [
+        [_btn("🔵 آبی", f"admin:colset:{bid}:primary")],
+        [_btn("🟢 سبز", f"admin:colset:{bid}:success")],
+        [_btn("🔴 قرمز", f"admin:colset:{bid}:danger")],
+        [_btn("⚪️ پیش‌فرض (حذف رنگ)", f"admin:colset:{bid}:default")],
+        [_btn("🔙 بازگشت", f"admin:colsec:{section_of(key)}")],
+    ]
+    await callback.message.edit_text(
+        f"دکمه: <b>{html.escape(label)}</b>\nرنگ فعلی: {cur}\n\n3️⃣ رنگ را انتخاب کنید:",
+        parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
+
+@router.callback_query(F.data.regexp(r"^admin:colset:\d+:(primary|success|danger|default)$"))
+async def color_apply(callback: CallbackQuery, state: FSMContext):
+    _, _, bid, style = callback.data.split(":")
+    row = get_seen_button(int(bid))
+    if not row:
+        await callback.answer("دکمه پیدا نشد", show_alert=True)
+        return
+    _id, key, label = row
+    if style == "default":
+        delete_button_color(key)
+        msg = f"⚪️ رنگ دکمه <b>{html.escape(label)}</b> به حالت پیش‌فرض برگشت."
+    else:
+        set_button_color(key, style)
+        msg = f"✅ دکمه <b>{html.escape(label)}</b> → {STYLE_ICON[style]} {STYLE_NAME[style]}"
+    rows = [[_btn("🔙 بازگشت به همان بخش", f"admin:colsec:{section_of(key)}")],
+            [_btn("🎨 مدیریت رنگ‌ها", "admin:colors")]]
+    await callback.message.edit_text(msg, parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:color_clear")
+async def color_clear_all(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    db_path = Path("storage/customization.db")
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM button_colors")
+            conn.commit()
+    await custom_colors_list(callback, state)
+
+# ==================== ۳. تغییر نام دکمه‌ها ====================
+@router.callback_query(F.data == "admin:custom_renames")
+async def custom_renames_list(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    renames = get_button_renames()
+    text = "✏️ <b>تغییر نام دکمه‌ها</b>\n\nلیست نام‌های سفارشی:\n"
+    if not renames:
+        text += "هیچ نام سفارشی ثبت نشده است.\n"
+    else:
+        for k, v in renames.items():
+            text += f"• <code>{k}</code> ➔ <code>{v}</code>\n"
+            
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ تغییر نام جدید", callback_data="admin:rename_add")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm:ui")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:rename_add")
+async def rename_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CustomUIStates.waiting_for_rename_old)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="admin:custom_renames")]
+    ])
+    await callback.message.edit_text("1️⃣ لطفاً <b>نام فعلی دکمه</b> را ارسال کنید:", parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+@router.message(CustomUIStates.waiting_for_rename_old)
+async def rename_receive_old(message: Message, state: FSMContext):
+    old_name = (message.text or "").strip()
+    if not old_name:
+        return
+    await state.update_data(old_name=old_name)
+    await state.set_state(CustomUIStates.waiting_for_rename_new)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="admin:custom_renames")]
+    ])
+    await message.answer(f"✅ نام فعلی ( {old_name} ) دریافت شد.\n\n2️⃣ حالا <b>نام جدید</b> دکمه را ارسال کنید:", parse_mode="HTML", reply_markup=keyboard)
+
+@router.message(CustomUIStates.waiting_for_rename_new)
+async def rename_receive_new(message: Message, state: FSMContext):
+    new_name = (message.text or "").strip()
+    data = await state.get_data()
+    old_name = data.get("old_name")
+    if old_name and new_name:
+        set_button_rename(old_name, new_name)
+        await state.clear()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:custom_renames")]
+        ])
+        await message.answer(f"✅ نام دکمه از «{old_name}» به «{new_name}» تغییر یافت.", reply_markup=keyboard)
+
+# ==================== ۴. تغییر متن‌های ربات ====================
+@router.callback_query(F.data == "admin:custom_texts")
+async def custom_texts_list(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    replacements = get_text_replacements()
+    text = "📝 <b>تغییر متن‌های ربات</b>\n\nلیست جایگزینی متن‌ها:\n"
+    if not replacements:
+        text += "هیچ قانون جایگزینی ثبت نشده است.\n"
+    else:
+        for r_id, old_t, new_t in replacements:
+            text += f"• [{r_id}] <code>{old_t}</code> ➔ <code>{new_t}</code>\n"
+            
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ افزودن قانون متن", callback_data="admin:tx_add")],
+        [InlineKeyboardButton(text="✍️ ورود دستی متن", callback_data="admin:text_add")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm:ui")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:text_add")
+async def text_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CustomUIStates.waiting_for_text_old)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="admin:custom_texts")]
+    ])
+    await callback.message.edit_text("1️⃣ لطفاً <b>متن فعلی</b> را بفرستید:", parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+@router.message(CustomUIStates.waiting_for_text_old)
+async def text_receive_old(message: Message, state: FSMContext):
+    old_t = (message.text or "").strip()
+    if not old_t:
+        return
+    await state.update_data(old_t=old_t)
+    await state.set_state(CustomUIStates.waiting_for_text_new)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="admin:custom_texts")]
+    ])
+    await message.answer("✅ متن فعلی دریافت شد.\n\n2️⃣ حالا <b>متن جدید</b> را ارسال کنید:", parse_mode="HTML", reply_markup=keyboard)
+
+@router.message(CustomUIStates.waiting_for_text_new)
+async def text_receive_new(message: Message, state: FSMContext):
+    new_t = (message.text or "").strip()
+    data = await state.get_data()
+    old_t = data.get("old_t")
+    if old_t and new_t:
+        set_text_replacement(old_t, new_t)
+        await state.clear()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin:custom_texts")]
+        ])
+        await message.answer("✅ جایگزینی متن با موفقیت ثبت شد.", reply_markup=keyboard)
+
+# ---------- متن خوش‌آمدگویی ----------
+WELCOME_DEFAULT_EXAMPLE = "👋 سلام {name}\nبه فروشگاه CAPITAN VPN خوش آمدید.\nاز منوی زیر ادامه دهید."
+
+@router.callback_query(F.data == "admin:welcome")
+async def welcome_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    cur = get_ui_config("welcome_text")
+    shown = (f"<code>{html.escape(cur)}</code>" if cur else "پیش‌فرض ربات (تغییری داده نشده)")
+    rows = [
+        [_btn("✏️ تنظیم متن جدید", "admin:welcome_set")],
+        [_btn("♻️ بازگشت به پیش‌فرض", "admin:welcome_reset")],
+        [_btn("🔙 بازگشت", "adm:ui")],
+    ]
+    await callback.message.edit_text(
+        f"👋 <b>متن خوش‌آمدگویی</b>\n\nمتن فعلی:\n{shown}",
+        parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:welcome_set")
+async def welcome_set_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CustomUIStates.waiting_for_welcome)
+    rows = [[_btn("❌ انصراف", "admin:welcome")]]
+    await callback.message.edit_text(
+        "متن جدید خوش‌آمدگویی را بفرستید.\n\n"
+        "• جای اسم کاربر را با <code>{name}</code> بنویسید.\n"
+        "• می‌توانید چند خط، ایموجی و فرمت (بولد، ایتالیک) هم بزنید.\n\n"
+        "مثال:\n<code>" + html.escape(WELCOME_DEFAULT_EXAMPLE) + "</code>",
+        parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
+
+@router.message(CustomUIStates.waiting_for_welcome)
+async def welcome_receive(message: Message, state: FSMContext):
+    txt = (message.html_text or "").strip()
+    if not txt:
+        await message.answer("❌ لطفاً یک متن معتبر بفرستید.")
+        return
+    set_ui_config("welcome_text", txt)
+    await state.clear()
+    await message.answer("✅ متن خوش‌آمدگویی ذخیره شد. برای دیدنش در ربات /start بزنید.",
+                         reply_markup=_kb([[_btn("🔙 بازگشت", "admin:welcome")]]))
+
+@router.callback_query(F.data == "admin:welcome_reset")
+async def welcome_reset(callback: CallbackQuery, state: FSMContext):
+    set_ui_config("welcome_text", "")
+    await callback.answer("به حالت پیش‌فرض برگشت ✅", show_alert=True)
+    await welcome_menu(callback, state)
+
+# ---------- انتخاب متن از لیست (بخش‌بندی‌شده) ----------
+TX_SECTIONS = [(s_, t_) for s_, t_, _ in SECTIONS if s_ != "admin"]
+
+def _tx_label(line: str) -> str:
+    import re as _re
+    clean = _re.sub(r"<[^>]+>", "", line).strip()
+    return clean[:45] if clean else line[:45]
+
+@router.callback_query(F.data == "admin:tx_add")
+async def tx_sections(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    counts = {}
+    for _id, sec, _l in get_seen_lines():
+        counts[sec] = counts.get(sec, 0) + 1
+    rows = [[_btn(f"{t} ({counts[s_]})", f"admin:txsec:{s_}")]
+            for s_, t in TX_SECTIONS if counts.get(s_)]
+    has = len(rows) > 0
+    rows.append([_btn("✍️ ورود دستی متن", "admin:text_add")])
+    rows.append([_btn("🔙 بازگشت", "admin:custom_texts")])
+    text = ("1️⃣ <b>بخش</b> مورد نظر را انتخاب کنید:" if has else
+            "هنوز متنی ثبت نشده. چند صفحه ربات را باز کنید (مثلاً /start، خرید، سرویس‌ها) و دوباره بیایید.")
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:txsec:"))
+async def tx_section(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    sec = callback.data.split(":")[2]
+    title = next((t for s_, t in TX_SECTIONS if s_ == sec), sec)
+    rows = []
+    for lid, lsec, line in get_seen_lines():
+        if lsec == sec and len(rows) < 60:
+            rows.append([_btn(_tx_label(line), f"admin:txline:{lid}")])
+    rows.append([_btn("🔙 بازگشت به بخش‌ها", "admin:tx_add")])
+    await callback.message.edit_text(f"{title}\n\n2️⃣ متنی که می‌خواهید عوض شود را انتخاب کنید:",
+                                     reply_markup=_kb(rows))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:txline:"))
+async def tx_pick_line(callback: CallbackQuery, state: FSMContext):
+    lid = int(callback.data.split(":")[2])
+    row = get_seen_line(lid)
+    if not row:
+        await callback.answer("متن پیدا نشد", show_alert=True)
+        return
+    _id, sec, line = row
+    await state.update_data(old_t=line)
+    await state.set_state(CustomUIStates.waiting_for_text_new)
+    rows = [[_btn("❌ انصراف", f"admin:txsec:{sec}")]]
+    await callback.message.edit_text(
+        f"متن فعلی:\n<code>{html.escape(line)}</code>\n\n3️⃣ حالا <b>متن جدید</b> را بفرستید:",
+        parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.answer()
+
+# ==================== ۵. بازنشانی کل ظاهر ====================
+@router.callback_query(F.data == "admin:custom_reset")
+async def custom_reset_all(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ بله، پاکسازی کامل", callback_data="admin:reset_confirm")],
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="adm:ui")]
+    ])
+    await callback.message.edit_text("⚠️ آیا از پاکسازی و بازنشانی تمام تنظیمات ظاهری اطمینان دارید؟", reply_markup=keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:reset_confirm")
+async def custom_reset_confirmed(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    db_path = Path("storage/customization.db")
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            for tbl in ("premium_emojis", "text_replacements", "button_renames", "ui_config", "button_colors"):
+                try:
+                    conn.execute(f"DELETE FROM {tbl}")
+                except Exception:
+                    pass
+            conn.commit()
+    await callback.message.edit_text("✅ تمام تنظیمات ظاهری با موفقیت بازنشانی شد.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm:ui")]
+    ]))
+    await callback.answer()

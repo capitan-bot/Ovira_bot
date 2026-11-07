@@ -5,29 +5,23 @@ import sqlite3
 from pathlib import Path
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.methods import SendMessage, EditMessageText, SendPhoto, EditMessageCaption, EditMessageReplyMarkup
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 
 DB_PATH = Path("storage/customization.db")
 
-COLOR_PRESETS = {
-    "purple": {"title": "🟣 بنفش نئون", "badge": "🟣", "tg_style": None},
-    "green":  {"title": "🟢 سبز نئون", "badge": "🟢", "tg_style": "success"},
-    "red":    {"title": "🔴 قرمز ویژه", "badge": "🔴", "tg_style": "danger"},
-    "blue":   {"title": "🔵 آبی الماسی", "badge": "🔵", "tg_style": "primary"},
-    "gold":   {"title": "🟡 طلایی VIP", "badge": "🟡", "tg_style": None},
-    "orange": {"title": "🟠 نارنجی", "badge": "🟠", "tg_style": None},
-    "dark":   {"title": "⚫️ مشکی دارک", "badge": "⚫️", "tg_style": None},
-    "white":  {"title": "⚪️ سفید نقره‌ای", "badge": "⚪️", "tg_style": None},
-}
+COLOR_PRESETS = {}
 
-ALL_BADGES = tuple(v["badge"] for v in COLOR_PRESETS.values())
-
-def strip_color_badge(text: str) -> str:
-    t = text.strip()
-    for b in ALL_BADGES:
-        if t.startswith(b):
-            t = t[len(b):].strip()
-    return t
+DEFAULT_KNOWN_BUTTONS = [
+    {"text": "Multi protocol", "cb": "menu:multi"},
+    {"text": "CIP FASTEST", "cb": "menu:fastest"},
+    {"text": "دریافت کانفیگ", "cb": "menu:config"},
+    {"text": "ارسال گزارش", "cb": "menu:report"},
+    {"text": "لغو", "cb": "menu:cancel"},
+    {"text": "بازگشت", "cb": "menu:back"},
+    {"text": "سرویس‌های من", "cb": "menu:my_services"},
+    {"text": "کیف پول", "cb": "menu:wallet"},
+    {"text": "پشتیبانی", "cb": "menu:support"}
+]
 
 def init_custom_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -52,12 +46,6 @@ def init_custom_db() -> None:
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS button_colors (
-                btn_key TEXT PRIMARY KEY,
-                color_code TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
             CREATE TABLE IF NOT EXISTS ui_config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -65,23 +53,6 @@ def init_custom_db() -> None:
         """)
         conn.commit()
 
-    # انتقال ایموجی‌های قبلی از دیتابیس قدیمی در صورت وجود
-    old_db = Path("storage/emojis.db")
-    if old_db.exists():
-        try:
-            with sqlite3.connect(old_db) as oconn:
-                rows = oconn.execute("SELECT base_emoji, custom_emoji_id FROM premium_emojis").fetchall()
-            if rows:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO premium_emojis (base_emoji, custom_emoji_id) VALUES (?, ?)",
-                        rows
-                    )
-                    conn.commit()
-        except Exception:
-            pass
-
-# --- توابع ایموجی پریمیوم ---
 def set_premium_emoji(base_emoji: str, custom_emoji_id: str) -> None:
     init_custom_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -103,7 +74,6 @@ def get_all_emojis() -> dict[str, str]:
     with sqlite3.connect(DB_PATH) as conn:
         return dict(conn.execute("SELECT base_emoji, custom_emoji_id FROM premium_emojis").fetchall())
 
-# --- توابع جایگزینی متن‌های ربات ---
 def set_text_replacement(old_text: str, new_text: str) -> None:
     init_custom_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -125,7 +95,6 @@ def get_text_replacements() -> list[tuple[int, str, str]]:
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute("SELECT id, old_text, new_text FROM text_replacements ORDER BY id DESC").fetchall()
 
-# --- توابع تغییر نام دکمه‌ها ---
 def set_button_rename(old_label: str, new_label: str) -> None:
     init_custom_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -147,37 +116,27 @@ def get_button_renames() -> dict[str, str]:
     with sqlite3.connect(DB_PATH) as conn:
         return dict(conn.execute("SELECT old_label, new_label FROM button_renames").fetchall())
 
-# --- توابع رنگ دکمه‌ها ---
+# توابع نمایشی و خالی برای جلوگیری از خطای ایمپورت در بخش رنگ دکمه‌ها
 def set_button_color(btn_key: str, color_code: str) -> None:
-    init_custom_db()
-    clean_key = strip_color_badge(btn_key)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO button_colors (btn_key, color_code)
-            VALUES (?, ?)
-            ON CONFLICT(btn_key) DO UPDATE SET color_code = excluded.color_code
-        """, (clean_key, color_code.strip()))
+    with closing(_color_db()) as conn:
+        conn.execute("INSERT INTO button_colors (btn_key, color) VALUES (?, ?) "
+                     "ON CONFLICT(btn_key) DO UPDATE SET color = excluded.color", (btn_key, color_code))
         conn.commit()
 
 def delete_button_color(btn_key: str) -> None:
-    init_custom_db()
-    clean_key = strip_color_badge(btn_key)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM button_colors WHERE btn_key = ? OR btn_key = ?", (btn_key.strip(), clean_key))
+    with closing(_color_db()) as conn:
+        conn.execute("DELETE FROM button_colors WHERE btn_key = ?", (btn_key,))
         conn.commit()
 
 def clear_all_button_colors() -> None:
-    init_custom_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(_color_db()) as conn:
         conn.execute("DELETE FROM button_colors")
         conn.commit()
 
 def get_button_colors() -> dict[str, str]:
-    init_custom_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        return dict(conn.execute("SELECT btn_key, color_code FROM button_colors").fetchall())
+    with closing(_color_db()) as conn:
+        return dict(conn.execute("SELECT btn_key, color FROM button_colors").fetchall())
 
-# --- تنظیمات کلی UI ---
 def set_ui_config(key: str, value: str) -> None:
     init_custom_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -194,25 +153,18 @@ def get_ui_config(key: str, default: str = "") -> str:
         row = conn.execute("SELECT value FROM ui_config WHERE key = ?", (key,)).fetchone()
         return row[0] if row else default
 
-# --- پردازشگر متن و ایموجی ---
 def process_outgoing_text(text: str, was_html: bool = False) -> tuple[str, bool]:
     if not text:
         return text, False
-
-    if any(k in text for k in ("مدیریت تغییرات ظاهری", "مدیریت ایموجی‌های پریمیوم", "مدیریت رنگ دکمه‌های ربات", "تغییر جایگاه و چیدمان")):
+    if any(k in text for k in ("مدیریت تغییرات ظاهری", "مدیریت ایموجی‌های پریمیوم")):
         return text, was_html
 
-    replacements = get_text_replacements()
-    for _, old_t, new_t in replacements:
+    for _, old_t, new_t in get_text_replacements():
         if old_t in text:
             text = text.replace(old_t, new_t)
 
     mapping = get_all_emojis()
-    if not mapping:
-        return text, was_html
-
-    has_match = any(base in text for base in mapping)
-    if not has_match:
+    if not mapping or not any(base in text for base in mapping):
         return text, was_html
 
     if not was_html and "<tg-emoji" not in text:
@@ -220,87 +172,158 @@ def process_outgoing_text(text: str, was_html: bool = False) -> tuple[str, bool]
 
     parts = re.split(r'(<tg-emoji[^>]*>.*?</tg-emoji>)', text, flags=re.DOTALL)
     for i in range(0, len(parts), 2):
-        segment = parts[i]
+        seg = parts[i]
         for base in sorted(mapping.keys(), key=len, reverse=True):
-            cid = mapping[base]
-            segment = segment.replace(base, f'<tg-emoji emoji-id="{cid}">{base}</tg-emoji>')
-        parts[i] = segment
+            seg = seg.replace(base, f'<tg-emoji emoji-id="{mapping[base]}">{base}</tg-emoji>')
+        parts[i] = seg
     return "".join(parts), True
 
-def _apply_color_to_btn(btn, color_code: str) -> None:
-    preset = COLOR_PRESETS.get(color_code)
-    if not preset:
+def _apply_button_emojis(markup) -> None:
+    """Moves a registered premium emoji out of the button text into icon_custom_emoji_id (Bot API 9.4+)."""
+    if not isinstance(markup, InlineKeyboardMarkup) or not markup.inline_keyboard:
         return
-    badge = preset["badge"]
-    clean_text = strip_color_badge(btn.text)
-    btn.text = f"{badge} {clean_text}"
-    try:
-        if preset.get("tg_style"):
-            object.__setattr__(btn, "style", preset["tg_style"])
-    except Exception:
-        pass
+    mapping = get_all_emojis()
+    if not mapping:
+        return
+    keys = sorted(mapping.keys(), key=len, reverse=True)
+    for row in markup.inline_keyboard:
+        for btn in row:
+            if "icon_custom_emoji_id" not in type(btn).model_fields or getattr(btn, "icon_custom_emoji_id", None):
+                continue
+            for base in keys:
+                for variant in (base, base.replace("\ufe0f", "")):
+                    if variant and variant in btn.text:
+                        rest = " ".join(btn.text.replace(variant, "", 1).replace("\ufe0f", "").split())
+                        if rest:
+                            btn.text = rest
+                            btn.icon_custom_emoji_id = mapping[base]
+                        break
+                else:
+                    continue
+                break
 
-# --- پردازشگر کیبورد، چیدمان، نام و رنگ دکمه‌ها ---
+from contextlib import closing
+
+SECTIONS = [
+    ("admin", "🛠 پنل مدیریت", ("adm:", "admin:")),
+    ("main", "🏠 صفحهٔ اصلی و منوها", ("menu:",)),
+    ("services", "📦 اشتراک و سرویس‌ها", ("svc:", "test:")),
+    ("wallet", "💳 کیف پول و پرداخت", ("wallet:", "charge:", "rcpt:")),
+    ("other", "🧩 سایر", ()),
+]
+_VALID_STYLES = ("primary", "success", "danger")
+
+
+def section_of(key: str) -> str:
+    for sec, _title, prefixes in SECTIONS:
+        if prefixes and key.startswith(prefixes):
+            return sec
+    return "other"
+
+
+def button_key(cb: str) -> str:
+    """svc:q:12 and svc:q:97 are the same button type: drop the numeric parts."""
+    parts = [p for p in str(cb).split(":") if not p.lstrip("-").isdigit()]
+    return ":".join(parts) or str(cb)
+
+
+def _color_db():
+    init_custom_db()
+    conn = sqlite3.connect(DB_PATH)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(button_colors)")]
+    if cols and "btn_key" not in cols:
+        conn.execute("DROP TABLE button_colors")
+    conn.execute("CREATE TABLE IF NOT EXISTS button_colors (btn_key TEXT PRIMARY KEY, color TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS seen_buttons "
+                 "(id INTEGER PRIMARY KEY AUTOINCREMENT, btn_key TEXT UNIQUE NOT NULL, label TEXT NOT NULL)")
+    return conn
+
+
+def record_seen_buttons(items: list) -> None:
+    if not items:
+        return
+    with closing(_color_db()) as conn:
+        conn.executemany("INSERT INTO seen_buttons (btn_key, label) VALUES (?, ?) "
+                         "ON CONFLICT(btn_key) DO UPDATE SET label = excluded.label", items)
+        conn.commit()
+
+
+def get_seen_buttons() -> list:
+    with closing(_color_db()) as conn:
+        return conn.execute("SELECT id, btn_key, label FROM seen_buttons ORDER BY id").fetchall()
+
+
+def get_seen_button(button_id: int):
+    with closing(_color_db()) as conn:
+        return conn.execute("SELECT id, btn_key, label FROM seen_buttons WHERE id = ?", (button_id,)).fetchone()
+
+
+def _apply_button_colors(markup) -> None:
+    """Sets the Bot API 9.4 button style (primary / success / danger) and remembers every button it sees."""
+    if not isinstance(markup, InlineKeyboardMarkup) or not markup.inline_keyboard:
+        return
+    colors = get_button_colors()
+    seen = {}
+    for row in markup.inline_keyboard:
+        for btn in row:
+            cb = getattr(btn, "callback_data", None)
+            if not cb:
+                continue
+            key = button_key(cb)
+            if key.startswith("admin:col"):
+                continue
+            seen[key] = (btn.text or "")[:60]
+            color = colors.get(key)
+            if color in _VALID_STYLES and not getattr(btn, "style", None) and "style" in type(btn).model_fields:
+                btn.style = color
+    record_seen_buttons(list(seen.items()))
+
+
 def process_reply_markup(markup):
     if not markup:
         return markup
 
     renames = get_button_renames()
-    colors = get_button_colors()
 
     if isinstance(markup, InlineKeyboardMarkup) and markup.inline_keyboard:
         all_cbs = [getattr(b, "callback_data", "") or "" for row in markup.inline_keyboard for b in row]
         is_admin_kb = any(cb.startswith("adm:") for cb in all_cbs)
 
-        if not is_admin_kb and len(all_cbs) >= 3:
-            flat_btns = [{"text": strip_color_badge(b.text), "cb": b.callback_data} for row in markup.inline_keyboard for b in row if b.callback_data]
-            if any("menu:" in x["cb"] or "buy" in x["cb"] or "service" in x["cb"] or "test" in x["cb"] or "charge" in x["cb"] for x in flat_btns):
-                if not get_ui_config("detected_main_buttons"):
-                    set_ui_config("detected_main_buttons", json.dumps(flat_btns, ensure_ascii=False))
+        existing_raw = get_ui_config("detected_main_buttons")
+        existing_list = json.loads(existing_raw) if existing_raw else []
+        seen_cbs = {item["cb"] for item in existing_list}
+        
+        updated = False
+        for row in markup.inline_keyboard:
+            for b in row:
+                if b.callback_data and not b.callback_data.startswith("adm:") and not b.callback_data.startswith("menu:buy") and not b.callback_data.startswith("menu:free_test"):
+                    clean_t = re.sub(r'[\U00010000-\U0010ffff]|[\u2600-\u27bf]', '', b.text).strip()
+                    if b.callback_data not in seen_cbs:
+                        existing_list.append({"text": clean_t or b.text, "cb": b.callback_data})
+                        seen_cbs.add(b.callback_data)
+                        updated = True
 
-                custom_layout_raw = get_ui_config("custom_main_layout")
-                if custom_layout_raw:
-                    try:
-                        layout_grid = json.loads(custom_layout_raw)
-                        btn_map = {b.callback_data: b for row in markup.inline_keyboard for b in row if b.callback_data}
-                        layout_cbs = [cb for r in layout_grid for cb in r]
-                        if set(layout_cbs).issubset(set(btn_map.keys())) and len(btn_map) == len(layout_cbs):
-                            new_rows = []
-                            for r in layout_grid:
-                                row_objs = [btn_map[cb] for cb in r if cb in btn_map]
-                                if row_objs:
-                                    new_rows.append(row_objs)
-                            markup.inline_keyboard = new_rows
-                    except Exception:
-                        pass
+        for kb_item in DEFAULT_KNOWN_BUTTONS:
+            if kb_item["cb"] not in seen_cbs:
+                existing_list.append(kb_item)
+                seen_cbs.add(kb_item["cb"])
+                updated = True
+
+        if updated or not existing_raw:
+            set_ui_config("detected_main_buttons", json.dumps(existing_list, ensure_ascii=False))
 
         if not is_admin_kb:
             for row in markup.inline_keyboard:
                 for btn in row:
-                    orig_clean = strip_color_badge(btn.text)
-                    cb_data = getattr(btn, "callback_data", "") or ""
+                    clean_text = re.sub(r'[\U00010000-\U0010ffff]|[\u2600-\u27bf]', '', btn.text).strip()
                     if btn.text in renames:
                         btn.text = renames[btn.text]
-                    elif orig_clean in renames:
-                        btn.text = renames[orig_clean]
-                    matched_color = colors.get(cb_data) or colors.get(orig_clean) or colors.get(strip_color_badge(btn.text))
-                    if matched_color:
-                        _apply_color_to_btn(btn, matched_color)
+                    elif clean_text in renames:
+                        btn.text = renames[clean_text]
 
-    elif isinstance(markup, ReplyKeyboardMarkup) and markup.keyboard:
-        for row in markup.keyboard:
-            for btn in row:
-                orig_clean = strip_color_badge(btn.text)
-                if btn.text in renames:
-                    btn.text = renames[btn.text]
-                elif orig_clean in renames:
-                    btn.text = renames[orig_clean]
-                matched_color = colors.get(orig_clean) or colors.get(strip_color_badge(btn.text))
-                if matched_color:
-                    _apply_color_to_btn(btn, matched_color)
-
+    _apply_button_emojis(markup)
+    _apply_button_colors(markup)
     return markup
-
 
 class CustomizationMiddleware(BaseRequestMiddleware):
     async def __call__(self, make_request, bot, method):
@@ -308,6 +331,8 @@ class CustomizationMiddleware(BaseRequestMiddleware):
             if getattr(method, "text", None):
                 pm = getattr(method, "parse_mode", None)
                 was_html = str(pm).upper() == "HTML" if pm else False
+                record_seen_text(method.text, getattr(method, 'reply_markup', None))
+                method.text, was_html = apply_welcome(method.text, getattr(method, 'reply_markup', None), was_html)
                 new_text, use_html = process_outgoing_text(method.text, was_html=was_html)
                 method.text = new_text
                 if use_html:
@@ -319,6 +344,7 @@ class CustomizationMiddleware(BaseRequestMiddleware):
             if getattr(method, "caption", None):
                 pm = getattr(method, "parse_mode", None)
                 was_html = str(pm).upper() == "HTML" if pm else False
+                record_seen_text(method.caption, getattr(method, 'reply_markup', None))
                 new_cap, use_html = process_outgoing_text(method.caption, was_html=was_html)
                 method.caption = new_cap
                 if use_html:
@@ -331,3 +357,74 @@ class CustomizationMiddleware(BaseRequestMiddleware):
                 method.reply_markup = process_reply_markup(method.reply_markup)
 
         return await make_request(bot, method)
+
+
+def _text_db():
+    conn = _color_db()
+    conn.execute("CREATE TABLE IF NOT EXISTS seen_lines "
+                 "(id INTEGER PRIMARY KEY AUTOINCREMENT, sec TEXT NOT NULL, line TEXT UNIQUE NOT NULL)")
+    return conn
+
+
+def record_seen_text(text, markup=None) -> None:
+    """Remembers every static line (no digits) of outgoing messages, grouped by section."""
+    try:
+        if not text:
+            return
+        sec = "other"
+        if isinstance(markup, InlineKeyboardMarkup):
+            found = False
+            for row in markup.inline_keyboard:
+                for b in row:
+                    cb = getattr(b, "callback_data", None)
+                    if cb:
+                        sec = section_of(button_key(cb))
+                        found = True
+                        break
+                if found:
+                    break
+        if sec == "admin":
+            return
+        items = []
+        for line in text.split("\n"):
+            ln = line.strip()
+            if 2 <= len(ln) <= 200 and not re.search(r"\d", ln):
+                items.append((sec, ln))
+        if not items:
+            return
+        with closing(_text_db()) as conn:
+            conn.executemany("INSERT OR IGNORE INTO seen_lines (sec, line) VALUES (?, ?)", items)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_seen_lines() -> list:
+    with closing(_text_db()) as conn:
+        return conn.execute("SELECT id, sec, line FROM seen_lines ORDER BY id").fetchall()
+
+
+def get_seen_line(line_id: int):
+    with closing(_text_db()) as conn:
+        return conn.execute("SELECT id, sec, line FROM seen_lines WHERE id = ?", (line_id,)).fetchone()
+
+
+def apply_welcome(text, markup, was_html):
+    """Replaces the main-menu welcome message with the admin-defined template ({name} = user's name)."""
+    try:
+        tpl = get_ui_config("welcome_text")
+        if not tpl or not text or not isinstance(markup, InlineKeyboardMarkup):
+            return text, was_html
+        cbs = {getattr(b, "callback_data", "") for row in markup.inline_keyboard for b in row}
+        if "menu:buy" not in cbs or "menu:wallet" not in cbs:
+            return text, was_html
+        plain = re.sub(r"<[^>]+>", "", text)
+        if "خوش آمدید" not in plain:
+            return text, was_html
+        m = re.search(r"سلام\s+(.+)", plain)
+        name = m.group(1).strip() if m else ""
+        if not was_html:
+            name = html.escape(name)
+        return tpl.replace("{name}", name), True
+    except Exception:
+        return text, was_html
