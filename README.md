@@ -1,3 +1,4 @@
+<div dir="rtl">
 
 # 🚀 CAPITAN VPN
 
@@ -172,3 +173,6 @@ pytest
 
 <p align="center">
 💎 ساخته‌شده با ❤️ توسط <b>Amiralihdtt</b> — <a href="https://t.me/Amiralihdtt">@Amiralihdtt</a>
+</p>
+
+</div>
