@@ -2,7 +2,7 @@
 # shellcheck disable=SC1091
 [ -f "$(dirname "$0")/banner.sh" ] && source "$(dirname "$0")/banner.sh" && show_banner
 set -euo pipefail
-REPO_URL="https://github.com/USER/REPO.git"
+REPO_URL="https://github.com/capitan-bot/Ovira_bot.git"
 DIR=/opt/capitan
 
 [ "$(id -u)" -eq 0 ] || { echo "❌ با کاربر root اجرا کنید (sudo -i)"; exit 1; }
