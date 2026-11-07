@@ -25,3 +25,5 @@ backup_final/
 storage/*.db
 .env
 __pycache__/
+*.bak*
+.env.backup*

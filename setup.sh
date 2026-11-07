@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
+[ -f "$(dirname "$0")/banner.sh" ] && source "$(dirname "$0")/banner.sh" && show_banner
 # CAPITAN VPN - interactive installer. Run: bash setup.sh
 set -euo pipefail cd "$(dirname "$0")" echo 
 "======================================" echo " CAPITAN 

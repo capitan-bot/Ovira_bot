@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
+[ -f "$(dirname "$0")/banner.sh" ] && source "$(dirname "$0")/banner.sh" && show_banner
 set -euo pipefail
 REPO_URL="https://github.com/USER/REPO.git"
 DIR=/opt/capitan
