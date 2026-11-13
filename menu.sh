@@ -3,10 +3,53 @@
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 cd "$DIR" || exit 1
 
-[ -f "$DIR/banner.sh" ] && source "$DIR/banner.sh" && show_banner
+C='\033[1;36m'; Y='\033[1;33m'; R='\033[1;31m'; G='\033[1;32m'
+M='\033[1;35m'; W='\033[1;37m'; D='\033[2m'; N='\033[0m'
+
+[ -f "$DIR/banner.sh" ] && source "$DIR/banner.sh"
 export CAPITAN_BANNER_SHOWN=1
 
-C='\033[1;36m'; Y='\033[1;33m'; R='\033[1;31m'; G='\033[1;32m'; N='\033[0m'
+bot_status() {
+  if docker compose ps --status running --services 2>/dev/null | grep -qx bot; then
+    echo -e "${G}● Running${N}"
+  else
+    echo -e "${R}● Stopped${N}"
+  fi
+}
+
+line() { echo -e "${C}  ──────────────────────────────────────────${N}"; }
+section() { echo -e "\n  ${M}▌ $1${N}"; }
+item() { echo -e "   ${Y}$1${N}  ${W}$2${N}"; }
+
+header() {
+  clear
+  if declare -f show_banner >/dev/null; then show_banner; fi
+  echo
+  line
+  echo -e "   ${W}Bot status:${N} $(bot_status)   ${D}|  $(date '+%Y-%m-%d %H:%M')${N}"
+  line
+}
+
+draw_menu() {
+  section "SETUP"
+  item "1" "🚀  Install"
+  item "2" "❌  Uninstall"
+  item "3" "🔄  Update"
+  section "BACKUP & LOGS"
+  item "4" "📋  Get logs"
+  item "5" "📦  Get backup"
+  item "6" "🔁  Add backup (restore)"
+  section "SETTINGS"
+  item "7" "🔑  Change bot token"
+  item "8" "🆔  Change admin IDs"
+  echo
+  line
+  item "0" "🚪  Exit"
+  line
+  echo
+}
+
+pause() { echo; read -r -p "$(echo -e "${D}Press Enter to go back to the menu...${N}")" _; }
 
 do_install() {
   echo -e "${G}>> Installing...${N}"
@@ -48,33 +91,24 @@ do_update() {
 do_logs()    { bash "$DIR/backup_tools.sh" logs; }
 do_backup()  { bash "$DIR/backup_tools.sh" backup; }
 do_restore() { bash "$DIR/backup_tools.sh" restore; }
-
 do_token()   { bash "$DIR/config_tools.sh" token; }
 do_admins()  { bash "$DIR/config_tools.sh" admins; }
 
 while true; do
+  header
+  draw_menu
+  read -r -p "$(echo -e "${C}  ➜ Select [0-8]: ${N}")" choice
   echo
-  echo -e "${C}  1) Install${N}"
-  echo -e "${C}  2) Uninstall${N}"
-  echo -e "${C}  3) Update${N}"
-  echo -e "${C}  4) Get logs${N}"
-  echo -e "${C}  5) Get backup${N}"
-  echo -e "${C}  6) Add backup (restore)${N}"
-  echo -e "${C}  7) Change bot token${N}"
-  echo -e "${C}  8) Change admin IDs${N}"
-  echo -e "${C}  0) Exit${N}"
-  echo
-  read -r -p "Select [0-8]: " choice
   case "$choice" in
-    1) do_install ;;
-    2) do_uninstall ;;
-    3) do_update ;;
-    4) do_logs ;;
-    5) do_backup ;;
-    6) do_restore ;;
-    7) do_token ;;
-    8) do_admins ;;
-    0) exit 0 ;;
-    *) echo "Invalid choice." ;;
+    1) do_install;   pause ;;
+    2) do_uninstall; pause ;;
+    3) do_update;    pause ;;
+    4) do_logs;      pause ;;
+    5) do_backup;    pause ;;
+    6) do_restore;   pause ;;
+    7) do_token;     pause ;;
+    8) do_admins;    pause ;;
+    0) echo -e "${G}Bye 👋${N}"; exit 0 ;;
+    *) echo -e "${R}Invalid choice.${N}"; sleep 1 ;;
   esac
 done
