@@ -45,18 +45,35 @@ do_update() {
   docker compose logs --tail 15 bot
 }
 
+do_logs()    { bash "$DIR/backup_tools.sh" logs; }
+do_backup()  { bash "$DIR/backup_tools.sh" backup; }
+do_restore() { bash "$DIR/backup_tools.sh" restore; }
+
+do_token()   { bash "$DIR/config_tools.sh" token; }
+do_admins()  { bash "$DIR/config_tools.sh" admins; }
+
 while true; do
   echo
   echo -e "${C}  1) Install${N}"
   echo -e "${C}  2) Uninstall${N}"
   echo -e "${C}  3) Update${N}"
+  echo -e "${C}  4) Get logs${N}"
+  echo -e "${C}  5) Get backup${N}"
+  echo -e "${C}  6) Add backup (restore)${N}"
+  echo -e "${C}  7) Change bot token${N}"
+  echo -e "${C}  8) Change admin IDs${N}"
   echo -e "${C}  0) Exit${N}"
   echo
-  read -r -p "Select [0-3]: " choice
+  read -r -p "Select [0-8]: " choice
   case "$choice" in
     1) do_install ;;
     2) do_uninstall ;;
     3) do_update ;;
+    4) do_logs ;;
+    5) do_backup ;;
+    6) do_restore ;;
+    7) do_token ;;
+    8) do_admins ;;
     0) exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
